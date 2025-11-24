@@ -1,3 +1,7 @@
+.. meta::
+    :description:
+        Table of contents for documentation on the Roundup Issue Tracker.
+
 =======================================================
 Roundup: an Issue-Tracking System for Knowledge Workers
 =======================================================
@@ -9,27 +13,48 @@ Contents
 
 .. toctree::
    :maxdepth: 2
+   :includehidden:
 
    features
+
    installation
    upgrading
+   security
    FAQ
+
    user_guide
-   customizing
-   admin_guide
-   debugging
-   xmlrpc
+
+   customising <customizing.txt>
    rest
-   overview
-   Design (original) <design>
-   developers
+   xmlrpc
+   reference
+   glossary
+
+   admin_guide
+   man pages <man_pages>
+   license
+   acknowledgements
+
+   upgrading-history
+
    tracker_templates
+
+   Design Overview <overview>
+   Design (original) <design>
+   Software Carpentry and Papers <sc>
+
+   developers
+
    Notes about the MySQL Database backend <mysql>
    Notes about the PostgreSQL Database backend <postgresql>
-   glossary
-   acknowledgements
+
    Richard Jones implementation notes <implementation>
-   license
+   security-history
+
+.. toctree::
+   :hidden:
+
+   pydoc
 
 See: https://wiki.roundup-tracker.org/ReleaseErrata for fixes to
 documentation.

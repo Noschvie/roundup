@@ -37,14 +37,30 @@ except ImportError:
 
 class DateTestCase(unittest.TestCase):
     def setUp(self):
+        # force use of local locale directory. System locale dir 
+        # doesn't have the locale files installed, and without wiping
+        # the default the .mo file sometimes isn't found.
+        self.backup_domain = i18n.DOMAIN
+        i18n.DOMAIN = ''
+        self.backup_locale_dirs = i18n.LOCALE_DIRS
+        i18n.LOCALE_DIRS=["locale"]
+
         self.old_gettext_ = i18n.gettext
         self.old_ngettext_ = i18n.ngettext
-        i18n.gettext = i18n.get_translation(language='C').gettext
-        i18n.ngettext = i18n.get_translation(language='C').ngettext
+        i18n.gettext = i18n.get_translation(
+            language='C', tracker_home=".").gettext
+        i18n.degettext = i18n.get_translation(
+            language='de', tracker_home=".").gettext
+        i18n.ngettext = i18n.get_translation(
+            language='C', tracker_home=".").ngettext
+        i18n.dengettext = i18n.get_translation(
+            language='de', tracker_home=".").ngettext
 
     def tearDown(self):
         i18n.gettext = self.old_gettext_
         i18n.ngettext = self.old_ngettext_
+        i18n.LOCALE_DIRS = self.backup_locale_dirs
+        i18n.DOMAIN = self.backup_domain
 
     def testDateInterval(self):
         ae = self.assertEqual
@@ -421,11 +437,56 @@ class DateTestCase(unittest.TestCase):
         ae('-1y', '1 year ago')
         ae('-2y', '2 years ago')
 
+    def testIntervalPrettyDe(self):
+        gettext = i18n.gettext
+        ngettext = i18n.ngettext
+
+        i18n.gettext = i18n.degettext
+        i18n.ngettext = i18n.dengettext
+        
+        def ae(spec, pretty):
+            self.assertEqual(Interval(spec).pretty(), pretty)
+        ae('2y', 'in 2 Jahren')
+        ae('1y', 'in 1 Jahr')
+        ae('2m', 'in 2 Monaten')
+        ae('59d', 'in 1 Monat')
+        ae('1m', 'in 1 Monat')
+        '''ae('29d', 'in 1 month')
+        ae('28d', 'in 4 weeks')
+        ae('8d', 'in 1 week')
+        ae('7d', 'in 7 days')
+        ae('1w', 'in 7 days')
+        ae('2d', 'in 2 days')
+        ae('1d', 'tomorrow')
+        ae('02:00:00', 'in 2 hours')
+        ae('01:59:00', 'in 1 3/4 hours')
+        ae('01:45:00', 'in 1 3/4 hours')
+        ae('01:30:00', 'in 1 1/2 hours')
+        ae('01:29:00', 'in 1 1/4 hours')
+        ae('01:00:00', 'in an hour')
+        ae('00:30:00', 'in 1/2 an hour')
+        ae('00:15:00', 'in 1/4 hour')
+        ae('00:02:00', 'in 2 minutes')
+        ae('00:01:00', 'in 1 minute')
+        ae('00:00:30', 'in a moment')
+        ae('-00:00:30', 'just now')
+        ae('-1d', 'yesterday')
+        ae('-1y', '1 year ago')
+        ae('-2y', '2 years ago')'''
+
+        i18n.gettext = gettext
+        i18n.ngettext = ngettext
+
     def testPyDatetime(self):
         d = datetime.datetime.now()
         Date(d)
         toomuch = datetime.MAXYEAR + 1
         self.assertRaises(ValueError, Date, (toomuch, 1, 1, 0, 0, 0, 0, 1, -1))
+
+    def testRfc3339Form(self):
+        ae = self.assertEqual
+        d = Date('2003-11-01T00:00:00')
+        self.assertEqual(str(d), '2003-11-01.00:00:00')
 
     def testSimpleTZ(self):
         ae = self.assertEqual
@@ -495,6 +556,16 @@ class TimezoneTestCase(unittest.TestCase):
         date = Date(date, tz)
         ae(str(date), '2006-01-01.11:00:00')
 
+    def testUnrecognizedTimezone(self):
+        '''Unrecognize timezone should raise key error'''
+
+        # unrecognized timezone
+        tz = 'Zoot'
+
+        with self.assertRaises(KeyError) as cm:
+            date = Date('2006-04-04.12:00:00', tz)
+
+        self.assertEqual(cm.exception.args, ('Zoot',))
 
 class RangeTestCase(unittest.TestCase):
 

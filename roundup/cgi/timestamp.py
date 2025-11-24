@@ -2,7 +2,11 @@
    form submission for cgi actions.
 '''
 
-import time, struct, binascii, base64
+import base64
+import binascii
+import struct
+import time
+
 from roundup.cgi.exceptions import FormError
 from roundup.i18n import _
 from roundup.anypy.strings import b2s, s2b
@@ -25,7 +29,7 @@ class Timestamped:
         try:
             created = unpack_timestamp(self.form[field].value)
         except KeyError:
-            raise FormError(_("Form is corrupted, missing: %s." % field))
+            raise FormError(_("Form is corrupted, missing: %s.") % field)
         if time.time() - created < delay:
             raise FormError(_("Responding to form too quickly."))
         return True

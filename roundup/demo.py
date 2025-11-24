@@ -5,11 +5,11 @@
 from __future__ import print_function
 
 import errno
+import getopt
 import os
 import shutil
 import socket
 import sys
-import getopt
 
 try:
     import urlparse
@@ -23,7 +23,7 @@ from roundup.scripts import roundup_server
 TRACKER_HOME = os.path.abspath('demo')
 
 
-def install_demo(home, backend, template):
+def install_demo(home, backend, template, use_port=None, use_host=None):
     """Install a demo tracker
 
     Parameters:
@@ -39,7 +39,13 @@ def install_demo(home, backend, template):
     from roundup import init, instance, password
 
     # set up the config for this tracker
-    config = configuration.CoreConfig()
+    template_dir = os.path.join('share', 'roundup', 'templates', template)
+
+    # Load optional override ini file. Missing ini file is ignored.
+    template_cfg = configuration.UserConfig(template_dir + "/config_ini.ini")
+    config = configuration.CoreConfig(settings={
+        i.name: i.get() for i in template_cfg.items()
+    })
     config['TRACKER_HOME'] = home
     config['MAIL_DOMAIN'] = 'localhost'
     config['DATABASE'] = 'db'
@@ -64,8 +70,18 @@ def install_demo(home, backend, template):
             print("    %s" % home)
             sys.exit(1)
 
-    template_dir = os.path.join('share', 'roundup', 'templates', template)
     init.install(home, template_dir)
+    # Remove config_ini.ini file from tracker_home (not template dir).
+    # Ignore file not found - not all templates have
+    #   config_ini.ini files.
+    try:
+        os.remove(home + "/config_ini.ini")
+    except OSError as e:  # FileNotFound exception under py3
+        if e.errno == 2:
+            pass
+        else:
+            raise
+
     # don't have email flying around
     nosyreaction = os.path.join(home, 'detectors', 'nosyreaction.py')
     if os.path.exists(nosyreaction):
@@ -75,9 +91,9 @@ def install_demo(home, backend, template):
         os.remove(nosyreaction)
 
     # figure basic params for server
-    hostname = 'localhost'
+    hostname = use_host or 'localhost'
     # pick a fairly odd, random port
-    port = 8917
+    port = use_port or 8917
     while 1:
         print('Trying to set up web server on port %d ...' % port,)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -97,42 +113,56 @@ def install_demo(home, backend, template):
 
     # write the config
     config['INSTANT_REGISTRATION'] = 1
-    # FIXME: Move template-specific demo initialization into the templates.
-    if template == 'responsive':
-        config['STATIC_FILES'] = "static"
-    if template == 'jinja2':
-        config['TEMPLATE_ENGINE'] = 'jinja2'
-        config['STATIC_FILES'] = "static"
     config.save(os.path.join(home, config.INI_FILE))
 
     # open the tracker and initialise
     tracker = instance.open(home)
-    tracker.init(password.Password('admin'))
+    tracker.init(password.Password('admin', config=config))
 
     # add the "demo" user
     db = tracker.open('admin')
     # FIXME: Move tracker-specific demo initialization into the tracker
     # templates.
-    if template == 'minimal':
-        db.user.create(username='demo', password=password.Password('demo'),
+    if os.path.basename(template) == 'minimal':
+        db.user.create(username='demo',
+                       password=password.Password('demo', config=db.config),
                        roles='User')
     else:
-        db.user.create(username='demo', password=password.Password('demo'),
+        db.user.create(username='demo',
+                       password=password.Password('demo', config=db.config),
                        realname='Demo User', roles='User')
     db.commit()
     db.close()
 
 
-def run_demo(home):
-    """Run the demo tracker instance from its ``home`` directory"""
-    print("Demo Tracker Home:", home)
+def run_demo(home, bind_addr=None, bind_port=None):
+    """Run the demo tracker instance from its ``home`` directory
+
+       For running under docker, we need to split ports into
+       the port roundup-server binds to (usually 8080) and the
+       external mapping requested by docker to be used in external url's.
+    """
+
+    print("\nDemo Tracker Home:", home)
 
     cfg = configuration.CoreConfig(home)
     url = cfg["TRACKER_WEB"]
-    hostname, port = urlparse.urlparse(url)[1].split(':')
-    port = int(port)
-    success_message = '''Server running - connect to:
-    %(url)s
+    try:
+        hostname, port = urlparse.urlparse(url)[1].split(':')
+    except ValueError:
+        print("\nThe TRACKER_WEB url:\n\n  %(url)s\n\nin\n\n"
+              "  %(home)s/config.ini"
+              "\n\nis missing a port number.\n"
+              "\nAre you using demo mode to start a production tracker? "
+              "Try running\ndemo mode with a different directory. "
+              "Use roundup-server to serve\nproduction trackers. "
+              "Exiting.\n" % {'home': home, 'url': url})
+        exit(1)
+
+    bind_addr = bind_addr or hostname
+    port = int(bind_port or port)
+    success_message = '''Server running - connect to:\n
+    %(url)s\n
 1. Log in as "demo"/"demo" or "admin"/"admin".
 2. Hit Control-C to stop the server.
 3. Re-start the server by running "%(script)s" again.
@@ -147,7 +177,7 @@ then restart demo. If you want to change backend types, you must use "nuke".
 ''' % dict(url=url, script=sys.argv[0], datadir=TRACKER_HOME)
 
     # disable command line processing in roundup_server
-    sys.argv = sys.argv[:1] + ['-p', str(port), '-n', hostname, 'demo=' + home]
+    sys.argv = sys.argv[:1] + ['-p', str(port), '-n', bind_addr, 'demo=' + home]
     roundup_server.run(success_message=success_message)
 
 

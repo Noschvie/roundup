@@ -21,19 +21,30 @@
 __docformat__ = 'restructuredtext'
 
 # standard python modules
-import os, re, shutil, sys, weakref
-import traceback
+import copy
 import logging
+import os
+import re
+import shutil
+import sys
+import traceback
+import weakref
+
+from hashlib import md5
 
 # roundup modules
 from . import date, password
 from .support import ensureParentsExist, PrioList
+from roundup.mlink_expr import Expression
 from roundup.i18n import _
 from roundup.cgi.exceptions import DetectorError
 from roundup.anypy.cmp_ import NoneAndDictComparable
-from roundup.anypy.strings import eval_import
+from roundup.anypy.strings import b2s, bs2b, eval_import
 
 logger = logging.getLogger('roundup.hyperdb')
+
+# marker used for an unspecified keyword argument
+_marker = []
 
 
 #
@@ -57,13 +68,13 @@ class _Type(object):
         """The default value when creating a new instance of this property."""
         return self.__default_value
 
-    def register (self, cls, propname):
+    def register(self, cls, propname):
         """Register myself to the class of which we are a property
            the given propname is the name we have in our class.
         """
         assert not getattr(self, 'cls', None)
         self.name = propname
-        self.cls  = cls
+        self.cls = cls
 
     def sort_repr(self, cls, val, name):
         """Representation used for sorting. This should be a python
@@ -76,7 +87,7 @@ class _Type(object):
 
 class String(_Type):
     """An object designating a String property."""
-    def __init__(self, indexme='no', required=False, default_value="",
+    def __init__(self, indexme='no', required=False, default_value=None,
                  quiet=False):
         super(String, self).__init__(required, default_value, quiet)
         self.indexme = indexme == 'yes'
@@ -109,10 +120,12 @@ class Password(_Type):
             return None
         try:
             return password.Password(encrypted=value, scheme=self.scheme,
-                                     strict=True)
+                                     strict=True,
+                                     config=kw['db'].config)
         except password.PasswordValueError as message:
-            raise HyperdbValueError(_('property %s: %s') %
-                                    (kw['propname'], message))
+            raise HyperdbValueError(_('property %(property)s: %(errormsg)s') %
+                                    {'property': kw['propname'],
+                                     'errormsg':  message})
 
     def sort_repr(self, cls, val, name):
         if not val:
@@ -121,13 +134,19 @@ class Password(_Type):
 
 
 class Date(_Type):
-    """An object designating a Date property."""
+    """An object designating a Date property.
+       The display_time parameter specifies if we want date and time or
+       date only. Both display_time and format are defaults for the
+       field method of the DateHTMLProperty (for rendering html).
+    """
     def __init__(self, offset=None, required=False, default_value=None,
-                 quiet=False):
+                 quiet=False, display_time='yes', format=None):
         super(Date, self).__init__(required=required,
                                    default_value=default_value,
                                    quiet=quiet)
         self._offset = offset
+        self.display_time = display_time == 'yes'
+        self.format = format
 
     def offset(self, db):
         if self._offset is not None:
@@ -138,9 +157,11 @@ class Date(_Type):
         try:
             value = date.Date(value, self.offset(db))
         except ValueError as message:
-            raise HyperdbValueError(_('property %s: %r is an invalid '
-                                      'date (%s)') % (kw['propname'],
-                                                      value, message))
+            raise HyperdbValueError(_(
+                'property %(property)s: %(value)r is an invalid '
+                'date (%(errormsg)s)') % {'property': kw['propname'],
+                                          'value': value,
+                                          'errormsg': message})
         return value
 
     def range_from_raw(self, value, db):
@@ -159,9 +180,12 @@ class Interval(_Type):
         try:
             value = date.Interval(value)
         except ValueError as message:
-            raise HyperdbValueError(_('property %s: %r is an invalid '
-                                      'date interval (%s)') %
-                                    (kw['propname'], value, message))
+            raise HyperdbValueError(_(
+                'property %(property)s: %(value)r is an invalid '
+                'date interval (%(errormsg)s)') %
+                                    {'property': kw['propname'],
+                                     'value': value,
+                                     'errormsg': message})
         return value
 
     def sort_repr(self, cls, val, name):
@@ -176,12 +200,16 @@ class _Pointer(_Type):
     def __init__(self, classname, do_journal='yes', try_id_parsing='yes',
                  required=False, default_value=None,
                  msg_header_property=None, quiet=False, rev_multilink=None):
-        """ Default is to journal link and unlink events.
+        """ The base class used by Link and Multilink classes.
+
+            Default is to journal link and unlink events.
+
             When try_id_parsing is false, we don't allow IDs in input
             fields (the key of the Link or Multilink property must be
             given instead). This is useful when the name of a property
             can be numeric. It will only work if the linked item has a
             key property and is a questionable feature for multilinks.
+
             The msg_header_property is used in the mail gateway when
             sending out messages: By default roundup creates headers of
             the form: 'X-Roundup-issue-prop: value' for all properties
@@ -193,6 +221,7 @@ class _Pointer(_Type):
             'msg_header_property="username"' for the assigned_to
             property will generated message headers of the form:
             'X-Roundup-issue-assigned_to: joe_user'.
+
             The rev_multilink is used to inject a reverse multilink into
             the Class linked by a Link or Multilink property. Note that
             the result is always a Multilink. The name given with
@@ -280,23 +309,23 @@ class Multilink(_Pointer):
                                         default_value=[], quiet=quiet,
                                         try_id_parsing=try_id_parsing,
                                         rev_multilink=rev_multilink)
-        self.rev_property  = rev_property
+        self.rev_property = rev_property
         self.rev_classname = None
-        self.rev_propname  = None
-        self.table_name    = None # computed in 'register' below
-        self.linkid_name   = 'linkid'
-        self.nodeid_name   = 'nodeid'
+        self.rev_propname = None
+        self.table_name = None  # computed in 'register' below
+        self.linkid_name = 'linkid'
+        self.nodeid_name = 'nodeid'
         if self.rev_property:
             # Do not allow updates if this is a reverse multilink
             self.computed = True
             self.rev_classname = rev_property.cls.classname
-            self.rev_propname  = rev_property.name
+            self.rev_propname = rev_property.name
             if isinstance(self.rev_property, Link):
-                self.table_name  = '_' + self.rev_classname
+                self.table_name = '_' + self.rev_classname
                 self.linkid_name = 'id'
                 self.nodeid_name = '_' + self.rev_propname
             else:
-                self.table_name  = self.rev_classname + '_' + self.rev_propname
+                self.table_name = self.rev_classname + '_' + self.rev_propname
                 self.linkid_name = 'nodeid'
                 self.nodeid_name = 'linkid'
 
@@ -325,7 +354,7 @@ class Multilink(_Pointer):
             item = item.strip()
 
             # skip blanks
-            if not item: continue
+            if not item: continue                                # noqa: E701
 
             # handle +/-
             remove = 0
@@ -413,8 +442,10 @@ class Number(_Type):
         try:
             value = float(value)
         except ValueError:
-            raise HyperdbValueError(_('property %s: %r is not a number') %
-                                    (kw['propname'], value))
+            raise HyperdbValueError(_(
+                'property %(property)s: %(value)r is not a number') %
+                                    {'property': kw['propname'],
+                                     'value': value})
         return value
 
 
@@ -425,8 +456,10 @@ class Integer(_Type):
         try:
             value = int(value)
         except ValueError:
-            raise HyperdbValueError(_('property %s: %r is not an integer') %
-                                    (kw['propname'], value))
+            raise HyperdbValueError(_(
+                'property %(property)s: %(value)r is not an integer') % {
+                    'property': kw['propname'],
+                    'value': value})
         return value
 
 
@@ -437,8 +470,11 @@ class DesignatorError(ValueError):
     pass
 
 
+dre = re.compile(r'^([A-Za-z](?:[A-Za-z_0-9]*[A-Za-z_]+)?)(\d+)$')
+
+
 def splitDesignator(designator,
-                    dre=re.compile(r'^([A-Za-z](?:[A-Za-z_0-9]*[A-Za-z_]+)?)(\d+)$')):
+                    dre=dre):
     """ Take a foo123 and return ('foo', 123)
     """
     m = dre.match(designator)
@@ -464,7 +500,7 @@ class Proptree(object):
 
     The Proptree is also used for transitively searching attributes for
     backends that do not support transitive search (e.g. anydbm). The
-    _val attribute with set_val is used for this.
+    val attribute with set_val is used for this.
     """
 
     def __init__(self, db, cls, name, props, parent=None, retr=False):
@@ -472,8 +508,9 @@ class Proptree(object):
         self.name = name
         self.props = props
         self.parent = parent
-        self._val = None
+        self.val = None
         self.has_values = False
+        self.has_result = False
         self.cls = cls
         self.classname = None
         self.uniqname = None
@@ -517,8 +554,9 @@ class Proptree(object):
         if name in self.propdict:
             pt = self.propdict[name]
             pt.need_for[need_for] = True
-            if retr and isinstance(pt.propclass, Link):
-                pt.append_retr_props()
+            # For now we do not recursively retrieve Link properties
+            # if retr and isinstance(pt.propclass, Link):
+            #    pt.append_retr_props()
             return pt
         propclass = self.props[name]
         cls = None
@@ -536,8 +574,9 @@ class Proptree(object):
                 child.need_child_retired = True
         self.children.append(child)
         self.propdict[name] = child
-        if retr and isinstance(child.propclass, Link):
-            child.append_retr_props()
+        # For now we do not recursively retrieve Link properties
+        # if retr and isinstance(child.propclass, Link):
+        #    child.append_retr_props()
         return child
 
     def append_retr_props(self):
@@ -583,31 +622,63 @@ class Proptree(object):
         exact_match_spec = {}
         for p in self.children:
             if 'search' in p.need_for:
-                if p.children:
+                x = [c for c in p.children if 'search' in c.need_for]
+                if x:
                     p.search(sort=False)
-                if getattr(p.propclass,'rev_property',None):
+                if getattr(p.propclass, 'rev_property', None):
                     pn = p.propclass.rev_property.name
                     cl = p.propclass.rev_property.cls
                     if not isinstance(p.val, type([])):
                         p.val = [p.val]
-                    if p.val == ['-1'] :
-                        s1 = set(self.cls.getnodeids(retired=False))
-                        s2 = set()
+                    nval = [int(i) for i in p.val]
+                    pval = [str(i) for i in nval if i >= 0]
+                    items = set()
+                    if not nval or min(nval) >= -1:
+                        if -1 in nval:
+                            s1 = set(self.cls.getnodeids(retired=False))
+                            s2 = set()
+                            for id in cl.getnodeids(retired=False):
+                                node = cl.getnode(id)
+                                if node[pn]:
+                                    if isinstance(node[pn], type([])):
+                                        s2.update(node[pn])
+                                    else:
+                                        s2.add(node[pn])
+                            items |= s1.difference(s2)
+                        if isinstance(p.propclass.rev_property, Link):
+                            items |= set(cl.get(x, pn) for x in pval
+                                         if not cl.is_retired(x))
+                        else:
+                            items |= set().union(*(cl.get(x, pn) for x in pval
+                                                   if not cl.is_retired(x)))
+                    else:
+                        # Expression: materialize rev multilinks and run
+                        # expression on them
+                        expr = Expression(nval)
+                        by_id = {}
+                        for id in self.cls.getnodeids(retired=False):
+                            by_id[id] = set()
+                        items = set()
                         for id in cl.getnodeids(retired=False):
                             node = cl.getnode(id)
                             if node[pn]:
-                                if isinstance(node [pn], type([])):
-                                    s2.update(node [pn])
-                                else:
-                                    s2.add(node [pn])
-                        items = s1.difference(s2)
-                    elif isinstance(p.propclass.rev_property, Link):
-                        items = set(cl.get(x, pn) for x in p.val
-                            if not cl.is_retired(x))
-                    else:
-                        items = set().union(*(cl.get(x, pn) for x in p.val
-                            if not cl.is_retired(x)))
-                    filterspec[p.name] = list(sorted(items))
+                                v = node[pn]
+                                if not isinstance(v, type([])):
+                                    v = [v]
+                                for x in v:
+                                    if x not in by_id:
+                                        continue
+                                    by_id[x].add(id)
+                        for k in by_id:
+                            if expr.evaluate(by_id[k]):
+                                items.add(k)
+
+                    # The subquery has found nothing. So it doesn't make
+                    # sense to search further.
+                    if not items:
+                        self.set_val([], force=True)
+                        return self.val
+                    filterspec[p.name] = list(sorted(items, key=int))
                 elif isinstance(p.val, type([])):
                     exact = []
                     subst = []
@@ -620,14 +691,21 @@ class Proptree(object):
                         exact_match_spec[p.name] = exact
                     if subst:
                         filterspec[p.name] = subst
-                    elif not exact: # don't set if we have exact criteria
-                        filterspec[p.name] =[ '-1' ] # no match was found
+                    elif not exact:  # don't set if we have exact criteria
+                        if p.has_result:
+                            # A subquery already has found nothing. So
+                            # it doesn't make sense to search further.
+                            self.set_val([], force=True)
+                            return self.val
+                        else:
+                            filterspec[p.name] = ['-1']  # no match was found
                 else:
                     assert not isinstance(p.val, Exact_Match)
                     filterspec[p.name] = p.val
-        self.val = self.cls._filter(search_matches, filterspec, sort and self,
-                                    retired=retired,
-                                    exact_match_spec=exact_match_spec)
+        self.set_val(self.cls._filter(search_matches, filterspec,
+                                      sort and self,
+                                      retired=retired,
+                                      exact_match_spec=exact_match_spec))
         return self.val
 
     def sort(self, ids=None):
@@ -715,8 +793,9 @@ class Proptree(object):
                 pt.sort_result = None
         return ids
 
-    def _set_val(self, val):
-        """ Check if self._val is already defined. If yes, we compute the
+    def set_val(self, val, force=False, result=True):
+        """ Check if self.val is already defined (it is not None and
+            has_values is True). If yes, we compute the
             intersection of the old and the new value(s)
             Note: If self is a Leaf node we need to compute a
             union: Normally we intersect (logical and) different
@@ -726,24 +805,56 @@ class Proptree(object):
             generated search will ensure a logical and of all tests for
             equality/substring search.
         """
+        if force:
+            assert val == []
+            assert result
+            self.val = val
+            self.has_values = True
+            self.has_result = True
+            return
         if self.has_values:
-            v = self._val
-            if not isinstance(self._val, type([])):
-                v = [self._val]
+            v = self.val
+            if not isinstance(self.val, type([])):
+                v = [self.val]
             vals = set(v)
             if not isinstance(val, type([])):
                 val = [val]
+        if self.has_result:
+            assert result
             # if cls is None we're a leaf
             if self.cls:
                 vals.intersection_update(val)
             else:
                 vals.update(val)
-            self._val = [v for v in vals]
+            self.val = list(vals)
         else:
-            self._val = val
+            # If a subquery found nothing we don't care if there is an
+            # expression
+            if not self.has_values or not val:
+                self.val = val
+                if result:
+                    self.has_result = True
+            else:
+                if not result:
+                    assert not self.cls
+                    vals.update(val)
+                    self.val = list(vals)
+                else:
+                    assert self.cls
+                    is_expression = \
+                        self.val and min(int(i) for i in self.val) < -1
+                    if is_expression:
+                        # Tag on the ORed values with an AND
+                        l = val
+                        for _i in range(len(val)-1):
+                            l.append('-4')
+                        l.append('-3')
+                        self.val = self.val + l
+                    else:
+                        vals.intersection_update(val)
+                        self.val = list(vals)
+                    self.has_result = True
         self.has_values = True
-
-    val = property(lambda self: self._val, _set_val)
 
     def _sort(self, val):
         """Finally sort by the given sortattr.sort_result. Note that we
@@ -879,17 +990,18 @@ All methods except __repr__ must be implemented by a concrete backend Database.
         for cn in self.getclasses():
             cl = self.getclass(cn)
             # This will change properties if a back-multilink happens to
-            # have the same class, so we need to iterate over .keys()
-            for p in cl.properties.keys():
+            # have the same class, so we need to iterate over a list made
+            # from .keys()
+            for p in list(cl.properties.keys()):
                 prop = cl.properties[p]
-                if not isinstance (prop, (Link, Multilink)):
+                if not isinstance(prop, (Link, Multilink)):
                     continue
                 if prop.rev_multilink:
                     linkcls = self.getclass(prop.classname)
                     if prop.rev_multilink in linkcls.properties:
                         if not done:
                             raise ValueError(
-                                "%s already a property of class %s"%
+                                "%s already a property of class %s" %
                                 (prop.rev_multilink, linkcls.classname))
                     else:
                         linkcls.properties[prop.rev_multilink] = Multilink(
@@ -953,10 +1065,12 @@ All methods except __repr__ must be implemented by a concrete backend Database.
         """
         return node
 
-    def getnode(self, classname, nodeid):
+    def getnode(self, classname, nodeid, allow_abort=True):
         """Get a node from the database.
 
         'cache' exists for backwards compatibility, and is not used.
+        'allow_abort' determines if we allow that the current
+        transaction is aborted due to a data error (e.g. invalid nodeid).
         """
         raise NotImplementedError
 
@@ -1027,6 +1141,7 @@ All methods except __repr__ must be implemented by a concrete backend Database.
         This method must be called at the end of processing.
 
         """
+        raise NotImplementedError
 
 
 def iter_roles(roles):
@@ -1088,8 +1203,9 @@ class Class:
         db.addclass(self)
 
         actions = "create set retire restore".split()
-        self.auditors = dict([(a, PrioList()) for a in actions])
-        self.reactors = dict([(a, PrioList()) for a in actions])
+        skey = lambda x: x[:2]
+        self.auditors = dict([(a, PrioList(key=skey)) for a in actions])
+        self.reactors = dict([(a, PrioList(key=skey)) for a in actions])
 
     def __repr__(self):
         """Slightly more useful representation
@@ -1097,7 +1213,7 @@ class Class:
            where self.classname isn't known yet if the error
            occurs during schema parsing.
         """
-        cn = getattr (self, 'classname', 'Unknown')
+        cn = getattr(self, 'classname', 'Unknown')
         return '<hyperdb.Class "%s">' % cn
 
     # Editing nodes:
@@ -1121,9 +1237,7 @@ class Class:
         """
         raise NotImplementedError
 
-    _marker = []
-
-    def get(self, nodeid, propname, default=_marker, cache=1):
+    def get(self, nodeid, propname, default=_marker, cache=1, allow_abort=True):
         """Get the value of a property on an existing node of this class.
 
         'nodeid' must be the id of an existing node of this class or an
@@ -1131,6 +1245,8 @@ class Class:
         of this class or a KeyError is raised.
 
         'cache' exists for backwards compatibility, and is not used.
+        'allow_abort' determines if we allow that the current
+        transaction is aborted due to a data error (e.g. invalid nodeid).
         """
         raise NotImplementedError
 
@@ -1188,8 +1304,10 @@ class Class:
         """
         raise NotImplementedError
 
-    def is_retired(self, nodeid):
+    def is_retired(self, nodeid, allow_abort=True):
         """Return true if the node is rerired
+           'allow_abort' specifies if we allow the transaction to be
+           aborted if a syntactically invalid nodeid is passed.
         """
         raise NotImplementedError
 
@@ -1488,14 +1606,20 @@ class Class:
         """
         raise NotImplementedError
 
-    def _proptree(self, filterspec, exact_match_spec={}, sortattr=[],
+    def _proptree(self, filterspec, exact_match_spec=None, sortattr=None,
                   retr=False):
         """Build a tree of all transitive properties in the given
         exact_match_spec/filterspec.
         If we retrieve (retr is True) linked items we don't follow
-        across multilinks. We also don't follow if the searched value
-        can contain NULL values.
+        across multilinks or links.
         """
+        if filterspec is None:
+            filterspec = {}
+        if exact_match_spec is None:
+            exact_match_spec = {}
+        if sortattr is None:
+            sortattr = []
+
         proptree = Proptree(self.db, self, '', self.getprops(), retr=retr)
         for exact, spec in enumerate((filterspec, exact_match_spec)):
             for key, v in spec.items():
@@ -1515,11 +1639,11 @@ class Class:
                         vv = []
                         for x in v:
                             vv.append(Exact_Match(x))
-                        p.val = vv
+                        p.set_val(vv, result=False)
                     else:
-                        p.val = [Exact_Match(v)]
+                        p.set_val([Exact_Match(v)], result=False)
                 else:
-                    p.val = v
+                    p.set_val(v, result=False)
         multilinks = {}
         for s in sortattr:
             keys = s[1].split('.')
@@ -1572,6 +1696,11 @@ class Class:
         with sanity checks (no duplicate properties) included. Always
         sort last by id -- if id is not already in sortattr.
         """
+        if sort is None:
+            sort = [(None, None)]
+        if group is None:
+            group = [(None, None)]
+
         seen = {}
         sortattr = []
         for srt in group, sort:
@@ -1620,7 +1749,7 @@ class Class:
         is returning the first item of a sorted search by specifying
         limit=1 (i.e. the maximum or minimum depending on sort order).
 
-        The filter must match all properties specificed. If the property
+        The filter must match all properties specified. If the property
         value to match is a list:
 
         1. String properties must match all elements in the list, and
@@ -1629,6 +1758,25 @@ class Class:
         This also means that for strings in exact_match_spec it doesn't
         make sense to specify multiple values because those cannot all
         be matched exactly.
+
+        For Link and Multilink properties the special ID value '-1'
+        matches empty Link or Multilink fields. For Multilinks a postfix
+        expression syntax using negative ID numbers (as strings) as
+        operators is supported. Each non-negative number (or '-1') is
+        pushed on an operand stack. A negative number pops the required
+        number of arguments from the stack, applies the operator, and
+        pushes the result. The following operators are supported:
+        - -2 stands for 'NOT' and takes one argument
+        - -3 stands for 'AND' and takes two arguments
+        - -4 stands for 'OR' and takes two arguments
+        Note that this special handling of ID arguments is applied only
+        when a negative number smaller than -1 is encountered as an ID
+        in the filter call. Otherwise the implicit OR default applies.
+        Examples of using Multilink expressions would be
+        - '1', '2', '-4', '3', '4', '-4', '-3'
+          would search for IDs (1 or 2) and (3 or 4)
+        - '-1' '-2' would search for all non-empty Multilinks
+
 
         The propname in filterspec and prop in a sort/group spec may be
         transitive, i.e., it may contain properties of the form
@@ -1664,6 +1812,60 @@ class Class:
     # anyway).
     filter_iter = filter
 
+    def filter_with_permissions(self, search_matches, filterspec, sort=[],
+                                group=[], retired=False, exact_match_spec={},
+                                limit=None, offset=None,
+                                permission='View', userid=None):
+        """ Do the same as filter but return only the items the user is
+            entitled to see, running the results through security checks.
+            The userid defaults to the current database user.
+        """
+        if userid is None:
+            userid = self.db.getuid()
+        cn = self.classname
+        sec = self.db.security
+        filterspec = sec.filterFilterspec(userid, cn, filterspec)
+        if exact_match_spec:
+            exact_match_spec = sec.filterFilterspec(userid, cn,
+                                                    exact_match_spec)
+        sort = sec.filterSortspec(userid, cn, sort)
+        group = sec.filterSortspec(userid, cn, group)
+        item_ids = self.filter(search_matches, filterspec, sort, group,
+                               retired, exact_match_spec, limit, offset)
+        check = sec.hasPermission
+        if check(permission, userid, cn, skip_permissions_with_check = True):
+            allowed = item_ids
+        else:
+            debug = self.db.config.RDBMS_DEBUG_FILTER
+            # Note that is_filterable returns True if no permissions are
+            # found. This makes it fail early (with an empty allowed list)
+            # instead of running through all ids with an empty
+            # permission list.
+            if not debug and sec.is_filterable(permission, userid, cn):
+                new_ids = set(item_ids)
+                confirmed = set()
+                for perm in sec.filter_iter(permission, userid, cn):
+                    fargs = perm.filter(self.db, userid, self)
+                    for farg in fargs:
+                        farg.update(sort=[], group=[], retired=None)
+                        result = self.filter(list(new_ids), **farg)
+                        new_ids.difference_update(result)
+                        confirmed.update(result)
+                        # all allowed?
+                        if not new_ids:
+                            break
+                    # all allowed?
+                    if not new_ids:
+                        break
+                # Need to sort again in database
+                allowed = self.filter(confirmed, {}, sort=sort, group=group,
+                                      retired=None)
+            else: # Last resort: filter in python
+                allowed = [id for id in item_ids
+                           if check(permission, userid, cn, itemid=id)]
+        return allowed
+
+
     def count(self):
         """Get the number of nodes in this class.
 
@@ -1681,12 +1883,14 @@ class Class:
         """
         raise NotImplementedError
 
-    def get_required_props(self, propnames=[]):
+    def get_required_props(self, propnames=None):
         """Return a dict of property names mapping to property objects.
         All properties that have the "required" flag set will be
         returned in addition to all properties in the propnames
         parameter.
         """
+        if propnames is None:
+            propnames = []
         props = self.getprops(protected=False)
         pdict = dict([(p, props[p]) for p in propnames])
         pdict.update([(k, v) for k, v in props.items() if v.required])
@@ -1763,10 +1967,10 @@ class Class:
         id and then proceeded to import journals for each id."""
         properties = self.getprops()
         a = []
-        for l in entries:
+        for entry in entries:
             # first element in sorted list is the (numeric) id
             # in python2.4 and up we would use sorted with a key...
-            a.append((int(l[0].strip("'")), l))
+            a.append((int(entry[0].strip("'")), entry))
         a.sort()
 
         last = 0
@@ -1835,7 +2039,10 @@ class HyperdbValueError(ValueError):
     pass
 
 
-def convertLinkValue(db, propname, prop, value, idre=re.compile(r'^\d+$')):
+id_regex = re.compile(r'^\d+$')
+
+
+def convertLinkValue(db, propname, prop, value, idre=id_regex):
     """ Convert the link value (may be id or key value) to an id value. """
     linkcl = db.classes[prop.classname]
     if not idre or not idre.match(value):
@@ -1843,8 +2050,12 @@ def convertLinkValue(db, propname, prop, value, idre=re.compile(r'^\d+$')):
             try:
                 value = linkcl.lookup(value)
             except KeyError:
-                raise HyperdbValueError(_('property %s: %r is not a %s.') % (
-                    propname, value, prop.classname))
+                raise HyperdbValueError(_(
+                    'property %(property)s: %(value)r '
+                    'is not a %(classname)s.') % {
+                        'property': propname,
+                        'value': value,
+                        'classname': prop.classname})
         else:
             raise HyperdbValueError(_('you may only enter ID values '
                                       'for property %s') % propname)
@@ -1880,8 +2091,10 @@ def rawToHyperdb(db, klass, itemid, propname, value, **kw):
     try:
         proptype = properties[propname]
     except KeyError:
-        raise HyperdbValueError(_('%r is not a property of %s') % (
-            propname, klass.classname))
+        raise HyperdbValueError(_(
+            '%(property)r is not a property of %(classname)s') % {
+                'property': propname,
+                'classname': klass.classname})
 
     # if we got a string, strip it now
     if isinstance(value, type('')):
@@ -1895,17 +2108,59 @@ def rawToHyperdb(db, klass, itemid, propname, value, **kw):
 
 
 class FileClass:
-    """ A class that requires the "content" property and stores it on
-        disk.
+    """ This class defines a large chunk of data. To support this, it
+        has a mandatory String property "content" which is saved off
+        externally to the hyperdb.
+
+        The default MIME type of this data is defined by the
+        "default_mime_type" class attribute, which may be overridden by
+        each node if the class defines a "type" String property.
     """
     default_mime_type = 'text/plain'
 
-    def __init__(self, db, classname, **properties):
+    def _update_properties(self, properties):
         """The newly-created class automatically includes the "content"
-        property.
+        and "type" properties. This method must be called by __init__.
         """
         if 'content' not in properties:
             properties['content'] = String(indexme='yes')
+        if 'type' not in properties:
+            properties['type'] = String()
+
+    def create(self, **propvalues):
+        """ snaffle the file propvalue and store in a file
+        """
+        # we need to fire the auditors now, or the content property won't
+        # be in propvalues for the auditors to play with
+        self.fireAuditors('create', None, propvalues)
+
+        # now remove the content property so it's not stored in the db
+        content = propvalues['content']
+        del propvalues['content']
+
+        # do the database create
+        newid = self.create_inner(**propvalues)
+
+        # figure the mime type
+        mime_type = propvalues.get('type', self.default_mime_type)
+
+        # optionally index
+        # This wasn't done for the anydbm backend (but the 'set' method
+        # *did* update the index) so this is probably a bug-fix for anydbm
+        if self.properties['content'].indexme:
+            index_content = content
+            if bytes != str and isinstance(content, bytes):
+                index_content = content.decode('utf-8', errors='ignore')
+            self.db.indexer.add_text((self.classname, newid, 'content'),
+                                     index_content, mime_type)
+
+        # store off the content as a file
+        self.db.storefile(self.classname, newid, None, bs2b(content))
+
+        # fire reactors
+        self.fireReactors('create', newid, None)
+
+        return newid
 
     def export_propnames(self):
         """ Don't export the "content" property
@@ -1933,6 +2188,45 @@ class FileClass:
         ensureParentsExist(dest)
         shutil.copyfile(source, dest)
 
+    def get(self, nodeid, propname, default=_marker, cache=1, allow_abort=True):
+        """ Trap the content propname and get it from the file
+
+        'cache' exists for backwards compatibility, and is not used.
+
+        'allow_abort' determines if we allow that the current
+        transaction is aborted due to a data error (e.g. invalid nodeid).
+        """
+        poss_msg = 'Possibly an access right configuration problem.'
+        if propname == 'content':
+            try:
+                return b2s(self.db.getfile(self.classname, nodeid, None))
+            except IOError as strerror:
+                # BUG: by catching this we don't see an error in the log.
+                return 'ERROR reading file: %s%s\n%s\n%s' % (
+                        self.classname, nodeid, poss_msg, strerror)
+            except UnicodeDecodeError:
+                # if content is not text (e.g. jpeg file) we get
+                # unicode error trying to convert to string in python 3.
+                # trap it and supply an error message. Include md5sum
+                # of content as this string is included in the etag
+                # calculation of the object.
+                return ('%s%s is not text, retrieve using '
+                        'binary_content property. mdsum: %s') % (
+                            self.classname, nodeid,
+                            md5(self.db.getfile(
+                                self.classname,
+                                nodeid,
+                                None)).hexdigest())  # nosec - bandit md5 use ok
+        elif propname == 'binary_content':
+            return self.db.getfile(self.classname, nodeid, None)
+
+        if default is not _marker:
+            return self.subclass.get(self, nodeid, propname, default,
+                                     allow_abort=allow_abort)
+        else:
+            return self.subclass.get(self, nodeid, propname,
+                                     allow_abort=allow_abort)
+
     def import_files(self, dirname, nodeid):
         """ Import the "content" property as a file
         """
@@ -1958,6 +2252,72 @@ class FileClass:
             self.db.indexer.add_text((self.classname, nodeid, 'content'),
                                      index_content, mime_type)
 
+    def index(self, nodeid):
+        """ Add (or refresh) the node to search indexes.
+
+        Use the content-type property for the content property.
+        """
+        # find all the String properties that have indexme
+        for prop, propclass in self.getprops().items():
+            if prop == 'content' and propclass.indexme:
+                mime_type = self.get(nodeid, 'type', self.default_mime_type)
+                index_content = self.get(nodeid, 'binary_content')
+                if bytes != str and isinstance(index_content, bytes):
+                    index_content = index_content.decode('utf-8',
+                                                         errors='ignore')
+                self.db.indexer.add_text((self.classname, nodeid, 'content'),
+                                         index_content, mime_type)
+            elif isinstance(propclass, String) and propclass.indexme:
+                # index them under (classname, nodeid, property)
+                try:
+                    value = str(self.get(nodeid, prop))
+                except IndexError:
+                    # node has been destroyed
+                    continue
+                self.db.indexer.add_text((self.classname, nodeid, prop), value)
+
+    def set(self, itemid, **propvalues):
+        """ Snarf the "content" propvalue and update it in a file
+        """
+        self.fireAuditors('set', itemid, propvalues)
+
+        # create the oldvalues dict - fill in any missing values
+        oldvalues = copy.deepcopy(self.db.getnode(self.classname, itemid))
+        # The following is redundant for rdbms backends but needed for anydbm
+        # the performance impact is so low we that we don't factor this.
+        for name, prop in self.getprops(protected=0).items():
+            if name in oldvalues:
+                continue
+            if isinstance(prop, Multilink):
+                oldvalues[name] = []
+            else:
+                oldvalues[name] = None
+
+        # now remove the content property so it's not stored in the db
+        content = None
+        if 'content' in propvalues:
+            content = propvalues['content']
+            del propvalues['content']
+
+        # do the database update
+        propvalues = self.set_inner(itemid, **propvalues)
+
+        # do content?
+        if content:
+            # store and possibly index
+            self.db.storefile(self.classname, itemid, None, bs2b(content))
+            if self.properties['content'].indexme:
+                index_content = content
+                if bytes != str and isinstance(content, bytes):
+                    index_content = content.decode('utf-8', errors='ignore')
+                mime_type = self.get(itemid, 'type', self.default_mime_type)
+                self.db.indexer.add_text((self.classname, itemid, 'content'),
+                                         index_content, mime_type)
+            propvalues['content'] = content
+
+        # fire reactors
+        self.fireReactors('set', itemid, oldvalues)
+        return propvalues
 
 class Node:
     """ A convenience wrapper for the given node
@@ -1970,16 +2330,16 @@ class Node:
         return list(self.cl.getprops(protected=protected).keys())
 
     def values(self, protected=1):
-        l = []
+        value_list = []
         for name in self.cl.getprops(protected=protected).keys():
-            l.append(self.cl.get(self.nodeid, name))
-        return l
+            value_list.append(self.cl.get(self.nodeid, name))
+        return value_list
 
     def items(self, protected=1):
-        l = []
+        item_list = []
         for name in self.cl.getprops(protected=protected).keys():
-            l.append((name, self.cl.get(self.nodeid, name)))
-        return l
+            item_list.append((name, self.cl.get(self.nodeid, name)))
+        return item_list
 
     def has_key(self, name):
         return name in self.cl.getprops()
@@ -2030,5 +2390,3 @@ def Choice(name, db, *options):
     for i in range(len(options)):
         cl.create(name=options[i], order=i)
     return Link(name)
-
-# vim: set filetype=python sts=4 sw=4 et si :

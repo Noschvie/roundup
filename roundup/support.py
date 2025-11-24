@@ -11,6 +11,9 @@ import os, time, sys
 class TruthDict:
     '''Returns True for valid keys, False for others.
     '''
+
+    __slots__ = ('keys',)
+
     def __init__(self, keys):
         if keys:
             self.keys = {}
@@ -41,7 +44,7 @@ class PrioList:
     ...  p.append(i)
     ...
     >>> for k in p:
-    ...  print k
+    ...  print (k)
     ...
     -1
     1
@@ -49,8 +52,12 @@ class PrioList:
     7
 
     '''
-    def __init__(self):
+
+    __slots__ = ('key', 'list', 'sorted')
+
+    def __init__(self, key=None):
         self.list = []
+        self.key = key
         self.sorted = True
 
     def append(self, item):
@@ -59,7 +66,7 @@ class PrioList:
 
     def __iter__(self):
         if not self.sorted:
-            self.list.sort()
+            self.list.sort(key=self.key)
             self.sorted = True
         return iter(self.list)
 
@@ -67,7 +74,6 @@ class PrioList:
 class Progress:
     '''Progress display for console applications.
 
-    See __main__ block at end of file for sample usage.
     '''
     def __init__(self, info, sequence):
         self.info = info

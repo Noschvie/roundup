@@ -5,7 +5,9 @@
 #
 
 from __future__ import print_function
-import unittest, os, shutil, errno, sys, difflib, cgi, re
+import unittest, os, shutil, errno, pytest, sys, difflib, re
+
+from contextlib import contextmanager 
 
 from roundup.anypy import xmlrpc_
 MultiCall = xmlrpc_.client.MultiCall
@@ -15,11 +17,40 @@ from roundup.xmlrpc import RoundupInstance, RoundupDispatcher
 from roundup.backends import list_backends
 from roundup.hyperdb import String
 from roundup.cgi import TranslationService
+from roundup.test.tx_Source_detector import init as tx_Source_init
 
 from . import db_test_base
 from .test_mysql import skip_mysql
 from .test_postgresql import skip_postgresql
 
+from .pytest_patcher import mark_class
+from roundup.anypy.xmlrpc_ import client
+
+if client.defusedxml:
+    skip_defusedxml = lambda func, *args, **kwargs: func
+else:
+    skip_defusedxml = mark_class(pytest.mark.skip(
+        reason='Skipping defusedxml tests: defusedxml library not available'))
+
+if sys.version_info[0] > 2:
+    skip_python2 = lambda func, *args, **kwargs: func
+else:
+    skip_python2 = mark_class(pytest.mark.skip(
+        reason='Skipping test under python 2'))
+
+@contextmanager
+def disable_defusedxml():
+    # if defusedxml not loaded, do nothing
+    if 'defusedxml' not in sys.modules:
+        yield
+        return
+
+    sys.modules['defusedxml'].xmlrpc.unmonkey_patch()
+    try:
+        yield
+    finally:
+        # restore normal defused xmlrpc functions
+        sys.modules['defusedxml'].xmlrpc.monkey_patch()
 
 class XmlrpcTest(object):
 
@@ -51,13 +82,7 @@ class XmlrpcTest(object):
 
         self.db.post_init()
 
-        thisdir = os.path.dirname(__file__)
-        vars = {}
-        exec(compile(open(os.path.join(thisdir,
-                                       "tx_Source_detector.py")).read(),
-                     os.path.join(thisdir, "tx_Source_detector.py"), 'exec'),
-             vars)
-        vars['init'](self.db)
+        tx_Source_init(self.db)
 
         self.server = RoundupInstance(self.db, self.instance.actions, None)
 
@@ -203,7 +228,6 @@ class XmlrpcTest(object):
 
     def testAuthFilter(self):
         # this checks if we properly check for search permissions
-        self.db.security.permissions = {}
         # self.db.security.set_props_only_default(props_only=False)
         self.db.security.addRole(name='User')
         self.db.security.addRole(name='Project')
@@ -319,6 +343,57 @@ class XmlrpcTest(object):
         for n, r in enumerate(result):
             self.assertEqual(r, results[n])
 
+    @skip_python2
+    @skip_defusedxml
+    def testDefusedXmlBomb(self):
+        self.XmlBomb(expectIn=b"defusedxml.common.EntitiesForbidden")
+
+    @skip_python2
+    def testNonDefusedXmlBomb(self):
+        with disable_defusedxml():
+            self.XmlBomb(expectIn=b"1234567890"*511)
+
+    def XmlBomb(self, expectIn=None):
+
+        bombInput = """<?xml version='1.0'?>
+        <!DOCTYPE xmlbomb [
+        <!ENTITY a "1234567890" >
+        <!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;">
+        <!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;">
+        <!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;">
+        ]>
+        <methodCall>
+        <methodName>filter</methodName>
+        <params>
+        <param>
+        <value><string>&d;</string></value>
+        </param>
+        <param>
+        <value><array><data>
+        <value><string>0</string></value>
+        <value><string>2</string></value>
+        <value><string>3</string></value>
+        </data></array></value>
+        </param>
+        <param>
+        <value><struct>
+        <member>
+        <name>username</name>
+        <value><string>demo</string></value>
+        </member>
+        </struct></value>
+        </param>
+        </params>
+        </methodCall>
+        """
+        translator = TranslationService.get_translation(
+            language=self.instance.config["TRACKER_LANGUAGE"],
+            tracker_home=self.instance.config["TRACKER_HOME"])
+        self.server = RoundupDispatcher(self.db, self.instance.actions,
+            translator, allow_none = True)
+        response = self.server.dispatch(bombInput)
+        print(response)
+        self.assertIn(expectIn, response)
 
 class anydbmXmlrpcTest(XmlrpcTest, unittest.TestCase):
     backend = 'anydbm'

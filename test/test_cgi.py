@@ -9,29 +9,38 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
 from __future__ import print_function
-import unittest, os, shutil, errno, sys, difflib, cgi, re, io
+import unittest, os, shutil, errno, sys, difflib, re, io
 
 import pytest
+import copy
 
+from os.path import normpath
+
+from roundup.anypy.cgi_ import cgi
 from roundup.cgi import client, actions, exceptions
-from roundup.cgi.exceptions import FormError, NotFound, Redirect
+from roundup.cgi.exceptions import FormError, NotFound, Redirect, NotModified
 from roundup.exceptions import UsageError, Reject
 from roundup.cgi.templating import HTMLItem, HTMLRequest, NoTemplate
 from roundup.cgi.templating import HTMLProperty, _HTMLItem, anti_csrf_nonce
+from roundup.cgi.templating import TemplatingUtils
 from roundup.cgi.form_parser import FormParser
 from roundup import init, instance, password, hyperdb, date
 from roundup.anypy.strings import u2s, b2s, s2b
+from roundup.test.tx_Source_detector import init as tx_Source_init
 
 from time import sleep
 
 # For testing very simple rendering
 from roundup.cgi.engine_zopetal import RoundupPageTemplate
 
-from .mocknull import MockNull
+from roundup.test.mocknull import MockNull
 
 from . import db_test_base
 from .db_test_base import FormTestParent, setupTracker, FileUpload
 from .cmp_helper import StringFragmentCmpHelper
+from .test_postgresql import skip_postgresql
+from .test_mysql import skip_mysql
+
 
 class FileList:
     def __init__(self, name, *files):
@@ -40,6 +49,24 @@ class FileList:
     def items (self):
         for f in self.files:
             yield (self.name, f)
+
+class testFtsQuery(object):
+
+    def testRenderContextFtsQuery(self):
+        self.db.issue.create(title='i1 is found', status="chatting")
+
+        self.client.form=db_test_base.makeForm(
+            { "@ok_message": "ok message", "@template": "index",
+            "@search_text": "found"})
+        self.client.path = 'issue'
+        self.client.determine_context()
+
+        result = self.client.renderContext()
+
+        expected = '">i1 is found</a>'
+
+        self.assertIn(expected, result)
+        self.assertEqual(self.client.response_code, 200)
 
 cm = client.add_message
 class MessageTestCase(unittest.TestCase):
@@ -78,18 +105,91 @@ class MessageTestCase(unittest.TestCase):
         self.assertEqual(cm([],'<i>x</i>\n<b>x</b>',False),
             ['<i>x</i><br />\n<b>x</b>'])
 
-class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
+class testCsvExport(object):
+
+    def testCSVExportBase(self):
+        cl = self._make_client(
+            {'@columns': 'id,title,status,keyword,assignedto,nosy,creation'},
+            nodeid=None, userid='1')
+        cl.classname = 'issue'
+
+        demo_id=self.db.user.create(username='demo', address='demo@test.test',
+            roles='User', realname='demo')
+        key_id1=self.db.keyword.create(name='keyword1')
+        key_id2=self.db.keyword.create(name='keyword2')
+
+        originalDate = date.Date
+        dummy=date.Date('2000-06-26.00:34:02.0')
+        # is a closure the best way to return a static Date object??
+        def dummyDate(adate=None):
+            def dummyClosure(adate=None, translator=None):
+                return dummy
+            return dummyClosure
+        date.Date = dummyDate()
+
+        self.db.issue.create(title='foo1', status='2', assignedto='4', nosy=['3',demo_id])
+        self.db.issue.create(title='bar2', status='1', assignedto='3', keyword=[key_id1,key_id2])
+        self.db.issue.create(title='baz32', status='4')
+        output = io.BytesIO()
+        cl.request = MockNull()
+        cl.request.wfile = output
+        # call export version that outputs names
+        actions.ExportCSVAction(cl).handle()
+        should_be=(s2b('"id","title","status","keyword","assignedto","nosy","creation"\r\n'
+                       '"1","foo1","deferred","","Contrary, Mary","Bork, Chef;Contrary, Mary;demo","2000-06-26 00:34"\r\n'
+                       '"2","bar2","unread","keyword1;keyword2","Bork, Chef","Bork, Chef","2000-06-26 00:34"\r\n'
+                       '"3","baz32","need-eg","","","","2000-06-26 00:34"\r\n'))
+
+
+        #print(should_be)
+        #print(output.getvalue())
+        self.assertEqual(output.getvalue(), should_be)
+        output = io.BytesIO()
+        cl.request = MockNull()
+        cl.request.wfile = output
+        # call export version that outputs id numbers
+        actions.ExportCSVWithIdAction(cl).handle()
+        should_be = s2b('"id","title","status","keyword","assignedto","nosy","creation"\r\n'
+                        '''"1","foo1","2","[]","4","['3', '4', '5']","2000-06-26.00:34:02"\r\n'''
+                        '''"2","bar2","1","['1', '2']","3","['3']","2000-06-26.00:34:02"\r\n'''
+                        '''"3","baz32","4","[]","None","[]","2000-06-26.00:34:02"\r\n''')
+        #print(should_be)
+        #print(output.getvalue())
+        self.assertEqual(output.getvalue(), should_be)
+
+        # reset the real date command
+        date.Date = originalDate
+
+        # test full text search
+        # call export version that outputs names
+        cl = self._make_client(
+            {'@columns': 'id,title,status,keyword,assignedto,nosy',
+             "@search_text": "bar2"}, nodeid=None, userid='1')
+        cl.classname = 'issue'
+        output = io.BytesIO()
+        cl.request = MockNull()
+        cl.request.wfile = output
+        actions.ExportCSVAction(cl).handle()
+        should_be=(s2b('"id","title","status","keyword","assignedto","nosy"\r\n'
+                       '"2","bar2","unread","keyword1;keyword2","Bork, Chef","Bork, Chef"\r\n'))
+
+        self.assertEqual(output.getvalue(), should_be)
+
+        # call export version that outputs id numbers
+        output = io.BytesIO()
+        cl.request = MockNull()
+        cl.request.wfile = output
+        actions.ExportCSVWithIdAction(cl).handle()
+        should_be = s2b('"id","title","status","keyword","assignedto","nosy"\r\n'
+                        "\"2\",\"bar2\",\"1\",\"['1', '2']\",\"3\",\"['3']\"\r\n")
+        self.assertEqual(output.getvalue(), should_be)
+
+class FormTestCase(FormTestParent, StringFragmentCmpHelper, testCsvExport, unittest.TestCase):
 
     def setUp(self):
         FormTestParent.setUp(self)
 
-        vars = {}
-        thisdir = os.path.dirname(__file__)
-        exec(compile(open(os.path.join(thisdir,
-                                       "tx_Source_detector.py")).read(),
-                     os.path.join(thisdir, "tx_Source_detector.py"), 'exec'),
-             vars)
-        vars['init'](self.db)
+        tx_Source_init(self.db)
 
         test = self.instance.backend.Class(self.db, "test",
             string=hyperdb.String(), number=hyperdb.Number(),
@@ -464,7 +564,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # assume that the "best" algorithm is the first one and doesn't
         # need migration, all others should be migrated.
         cl.db.config.WEB_LOGIN_ATTEMPTS_MIN = 200
-
+        cl.db.config.PASSWORD_PBKDF2_DEFAULT_ROUNDS = 10000
         # The third item always fails. Regardless of what is there.
         #  ['plaintext', 'SHA', 'crypt', 'MD5']:
         print(password.Password.deprecated_schemes)
@@ -475,22 +575,41 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
                 continue  # crypt is not available on Windows
             pw1 = password.Password('foo', scheme=scheme)
             print(pw1)
-            self.assertEqual(pw1.needs_migration(), True)
+            self.assertEqual(pw1.needs_migration(config=cl.db.config), True)
             self.db.user.set(chef, password=pw1)
             self.db.commit()
             actions.LoginAction(cl).handle()
-            pw = self.db.user.get(chef, 'password')
+            pw = cl.db.user.get(chef, 'password')
             print(pw)
             self.assertEqual(pw, 'foo')
-            self.assertEqual(pw.needs_migration(), False)
+            self.assertEqual(pw.needs_migration(config=cl.db.config), False)
+        cl.db.Otk = self.db.Otk
         pw1 = pw
-        self.assertEqual(pw1.needs_migration(), False)
+        self.assertEqual(pw1.needs_migration(config=cl.db.config), False)
         scheme = password.Password.known_schemes[0]
         self.assertEqual(scheme, pw1.scheme)
         actions.LoginAction(cl).handle()
-        pw = self.db.user.get(chef, 'password')
+        pw = cl.db.user.get(chef, 'password')
         self.assertEqual(pw, 'foo')
         self.assertEqual(pw, pw1)
+
+        # migrate if rounds has increased above rounds was 10000
+        # below will be 100000
+        cl.db.Otk = self.db.Otk
+        pw1 = pw
+        # do not use the production number of PBKDF2
+        os.environ["PYTEST_USE_CONFIG"] = "True"
+        cl.db.config.PASSWORD_PBKDF2_DEFAULT_ROUNDS = 100000
+        self.assertEqual(pw1.needs_migration(config=cl.db.config), True)
+        scheme = password.Password.known_schemes[0]
+        self.assertEqual(scheme, pw1.scheme)
+        actions.LoginAction(cl).handle()
+        pw = cl.db.user.get(chef, 'password')
+        self.assertEqual(pw, 'foo')
+        del(os.environ["PYTEST_USE_CONFIG"])
+        # do not assert self.assertEqual(pw, pw1) as pw is a 100,000
+        # cycle while pw1 is only 10,000. They won't compare equally.
+
         cl.db.close()
 
     def testPasswordConfigOption(self):
@@ -499,12 +618,12 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         cl = self._make_client(form)
         self.db.config.PASSWORD_PBKDF2_DEFAULT_ROUNDS = 1000
         pw1 = password.Password('foo', scheme='MD5')
-        self.assertEqual(pw1.needs_migration(), True)
+        self.assertEqual(pw1.needs_migration(config=cl.db.config), True)
         self.db.user.set(chef, password=pw1)
         self.db.commit()
         actions.LoginAction(cl).handle()
         pw = self.db.user.get(chef, 'password')
-        self.assertEqual('PBKDF2', pw.scheme)
+        self.assertEqual('PBKDF2S5', pw.scheme)
         self.assertEqual(1000, password.pbkdf2_unpack(pw.password)[0])
         cl.db.close()
 
@@ -751,6 +870,17 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
             'name': 'foo.txt', 'type': 'text/plain'}},
             [('issue', None, 'files', [('file', '-1')])]))
 
+    def testErrorForBadTemplate(self):
+         form = {}
+         cl = self.setupClient(form, 'issue', '1', template="broken",
+                 env_addon = {'HTTP_REFERER': 'http://whoami.com/path/'})
+         out = []
+
+         out = cl.renderContext()
+
+         self.assertEqual(out, '<strong>No template file exists for templating "issue" with template "broken" (neither "issue.broken" nor "_generic.broken")</strong>')
+         self.assertEqual(cl.response_code, 400)
+
     def testFormValuePreserveOnError(self):
         page_template = """
         <html>
@@ -805,6 +935,9 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         e2 = HTMLProperty.is_edit_ok
         HTMLProperty.is_edit_ok = lambda x : True
         cl.inner_main()
+        # The original self.db has been changed. Assign the new
+        # cl.db to self.db so it gets closed at the end of the test.
+        self.db = cl.db
         _HTMLItem.is_edit_ok = e1
         HTMLProperty.is_edit_ok = e2
         self.assertEqual(len(out), 1)
@@ -817,7 +950,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
           <p>deferred</p>
           <p>admin, anonymous</p>
           <p></p>
-          <p><input name="superseder" size="30" type="text" value="5000"></p>
+          <p><input id="superseder" name="superseder" size="30" type="text" value="5000"></p>
          </body>
         </html>
         """.strip ())
@@ -841,14 +974,15 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
             out.append(s)
         cl.write_html = wh
         cl.main()
+        self.db = cl.db # to close new db handle from main() at tearDown
         self.assertFalse('HTTP_PROXY' in cl.env)
         self.assertFalse('HTTP_PROXY' in os.environ)
 
-    def testCsrfProtection(self):
+    def testCsrfProtectionHtml(self):
         # need to set SENDMAILDEBUG to prevent
         # downstream issue when email is sent on successful
         # issue creation. Also delete the file afterwards
-        # just tomake sure that someother test looking for
+        # just to make sure that some other test looking for
         # SENDMAILDEBUG won't trip over ours.
         if 'SENDMAILDEBUG' not in os.environ:
             os.environ['SENDMAILDEBUG'] = 'mail-test1.log'
@@ -901,13 +1035,16 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         def hasPermission(s, p, classname=None, d=None, e=None, **kw):
             return True
         actions.Action.hasPermission = hasPermission
+        orig_HTMLItem_is_edit_ok = _HTMLItem.is_edit_ok
         e1 = _HTMLItem.is_edit_ok
         _HTMLItem.is_edit_ok = lambda x : True
         e2 = HTMLProperty.is_edit_ok
+        orig_HTMLProperty_is_edit_ok = HTMLProperty.is_edit_ok
         HTMLProperty.is_edit_ok = lambda x : True
 
-        # test with no headers and config by default requires 1 
-        cl.inner_main()
+        # test with no headers. Default config requires that 1 header
+        # is present and passes checks.
+        cl.main()
         match_at=out[0].find('Unable to verify sufficient headers')
         print("result of subtest 1:", out[0])
         self.assertNotEqual(match_at, -1)
@@ -916,15 +1053,26 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # all the rest of these allow at least one header to pass
         # and the edit happens with a redirect back to issue 1
         cl.env['HTTP_REFERER'] = 'http://whoami.com/path/'
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find('Redirecting to <a href="http://whoami.com/path/issue1?@ok_message')
         print("result of subtest 2:", out[0])
         self.assertEqual(match_at, 0)
         del(cl.env['HTTP_REFERER'])
         del(out[0])
 
+        # verify that HTTP_REFERER does not result in an XSS reflection
+        cl.env['HTTP_REFERER'] = '<script>alert(1)</script>'
+        cl.main()
+        match_at=out[0].find('<script>')
+        match_encoded_at=out[0].find('&lt;script&gt;')
+        print("\n\nresult of subtest 2a:", out[0])
+        self.assertEqual(match_at, -1) # must not find unencoded script tag
+        self.assertEqual(match_encoded_at, 53) # must find encoded script tag
+        del(cl.env['HTTP_REFERER'])
+        del(out[0])
+
         cl.env['HTTP_ORIGIN'] = 'http://whoami.com'
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find('Redirecting to <a href="http://whoami.com/path/issue1?@ok_message')
         print("result of subtest 3:", out[0])
         self.assertEqual(match_at, 0)
@@ -938,7 +1086,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # the proxy's name for the web server and not the name
         # thatis exposed to the world.
         cl.env['HTTP_HOST'] = 'frontend1.whoami.net'
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find('Redirecting to <a href="http://whoami.com/path/issue1?@ok_message')
         print("result of subtest 4:", out[0])
         self.assertNotEqual(match_at, -1)
@@ -947,7 +1095,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         del(out[0])
 
         cl.env['HTTP_HOST'] = 'whoami.com'
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find('Redirecting to <a href="http://whoami.com/path/issue1?@ok_message')
         print("result of subtest 5:", out[0])
         self.assertEqual(match_at, 0)
@@ -958,7 +1106,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         cl.env['HTTP_X_FORWARDED_HOST'] = 'whoami.net'
         # this raises an error as the header check passes and 
         # it did the edit and tries to send mail.
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find('Invalid X-FORWARDED-HOST whoami.net')
         print("result of subtest 6:", out[0])
         self.assertNotEqual(match_at, -1)
@@ -971,20 +1119,19 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
 
         # roundup will report a missing token.
         cl.db.config['WEB_CSRF_ENFORCE_TOKEN'] = 'required'
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find("<p>We can't validate your session (csrf failure). Re-enter any unsaved data and try again.</p>")
         print("result of subtest 6a:", out[0], match_at)
         self.assertEqual(match_at, 33)
         del(out[0])
         cl.db.config['WEB_CSRF_ENFORCE_TOKEN'] = 'yes'
 
-        import copy
         form2 = copy.copy(form)
         form2.update({'@csrf': 'booogus'})
-        # add a bogus csrf field to the form and rerun the inner_main
+        # add a bogus csrf field to the form and rerun main
         cl.form = db_test_base.makeForm(form2)
 
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find("We can't validate your session (csrf failure). Re-enter any unsaved data and try again.")
         print("result of subtest 7:", out[0])
         self.assertEqual(match_at, 36)
@@ -1001,9 +1148,9 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         self.assertEqual(isitthere, True)
 
         form2.update({'@csrf': nonce})
-        # add a real csrf field to the form and rerun the inner_main
+        # add a real csrf field to the form and rerun main
         cl.form = db_test_base.makeForm(form2)
-        cl.inner_main()
+        cl.main()
         # csrf passes and redirects to the new issue.
         match_at=out[0].find('Redirecting to <a href="http://whoami.com/path/issue1?@ok_message')
         print("result of subtest 9:", out[0])
@@ -1011,7 +1158,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         del(out[0])
 
         # try a replay attack
-        cl.inner_main()
+        cl.main()
         # This should fail as token was wiped by last run.
         match_at=out[0].find("We can't validate your session (csrf failure). Re-enter any unsaved data and try again.")
         print("replay of csrf after post use", out[0])
@@ -1025,9 +1172,9 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         form2 = copy.copy(form)
         nonce = anti_csrf_nonce(cl)
         form2.update({'@csrf': nonce})
-        # add a real csrf field to the form and rerun the inner_main
+        # add a real csrf field to the form and rerun main
         cl.form = db_test_base.makeForm(form2)
-        cl.inner_main()
+        cl.main()
         # csrf passes but fail creating new issue because not a post
         match_at=out[0].find('<p>Invalid request</p>')
         print("result of subtest 11:", out[0])
@@ -1043,7 +1190,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # since get deleted the token.
         cl.env.update({'REQUEST_METHOD': 'POST'})
         print(cl.env)
-        cl.inner_main()
+        cl.main()
         match_at=out[0].find("We can't validate your session (csrf failure). Re-enter any unsaved data and try again.")
         print("post failure after get", out[0])
         print("result of subtest 13:", out[0])
@@ -1051,11 +1198,433 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         del(out[0])
 
         del(cl.env['HTTP_REFERER'])
+
+        # test by setting allowed api origins to *
+        # this should not redirect as it is not an API call.
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = "  *  "
+        cl.env['HTTP_ORIGIN'] = 'https://baz.edu'
+        cl.main()
+        match_at=out[0].find('Invalid Origin https://baz.edu')
+        print("result of subtest invalid origin:", out[0])
+        self.assertEqual(match_at, 36)
+        del(cl.env['HTTP_ORIGIN'])
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = ""
+        del(out[0])
+
+        # test by setting allowed api origins to *
+        # this should not redirect as it is not an API call.
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = "  *  "
+        cl.env['HTTP_ORIGIN'] = 'http://whoami.com'
+        cl.env['HTTP_REFERER'] = 'https://baz.edu/path/'
+        cl.main()
+        match_at=out[0].find('Invalid Referer: https://baz.edu/path/')
+        print("result of subtest invalid referer:", out[0])
+        self.assertEqual(match_at, 36)
+        del(cl.env['HTTP_ORIGIN'])
+        del(cl.env['HTTP_REFERER'])
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = ""
+        del(out[0])
         
         # clean up from email log
         if os.path.exists(SENDMAILDEBUG):
             os.remove(SENDMAILDEBUG)
         #raise ValueError
+        # Undo monkey patching
+        _HTMLItem.is_edit_ok = orig_HTMLItem_is_edit_ok
+        HTMLProperty.is_edit_ok = orig_HTMLProperty_is_edit_ok
+
+    def testRestOriginValidationCredentials(self):
+        import json
+        # set the password for admin so we can log in.
+        passwd=password.Password('admin')
+        self.db.user.set('1', password=passwd)
+        self.db.commit()
+
+        out = []
+        def wh(s):
+           out.append(s)
+
+        # rest has no form content
+        form = cgi.FieldStorage()
+        # origin set to allowed value
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'GET',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_ORIGIN': 'http://whoami.com',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1",
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = {
+            'content-type': 'application/json',
+            'accept': 'application/json;version=1',
+            'origin': 'http://whoami.com',
+        }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from main() at tearDown
+        print(b2s(out[0]))
+        expected="""
+        {
+            "data": {
+                "collection": [],
+                "@total_size": 0
+            }
+        }"""
+
+        self.assertEqual(json.loads(b2s(out[0])),json.loads(expected))
+        self.assertIn('Access-Control-Allow-Credentials',
+                      cl.additional_headers)
+        self.assertEqual(
+            cl.additional_headers['Access-Control-Allow-Credentials'],
+            'true'
+        )
+        self.assertEqual(
+            cl.additional_headers['Access-Control-Allow-Origin'],
+            'http://whoami.com'
+        )
+        del(out[0])
+
+
+        # Origin not set. AKA same origin GET request.
+        # Should be like valid origin.
+        # Because of HTTP_X_REQUESTED_WITH header it should be
+        # preflighted.
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'GET',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1",
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # Should return explanation because content type is text/plain
+        # and not text/xml
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from main() at tearDown
+        self.assertIn('Access-Control-Allow-Credentials',
+                      cl.additional_headers)
+
+        self.assertEqual(json.loads(b2s(out[0])),json.loads(expected))
+        del(out[0])
+
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'OPTIONS',
+                            'HTTP_ORIGIN': 'http://invalid.com',
+                            'PATH_INFO':'rest/data/issue',
+                            'Access-Control-Request-Headers': 'Authorization',
+                            'Access-Control-Request-Method': 'GET',
+                           }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json',
+              'access-control-request-headers': 'Authorization',
+              'access-control-request-method': 'GET',
+        }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # Should return explanation because content type is text/plain
+        # and not text/xml
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from main() at tearDown
+        self.assertNotIn('Access-Control-Allow-Credentials',
+                      cl.additional_headers)
+
+        self.assertNotIn('Access-Control-Allow-Origin',
+            cl.additional_headers
+        )
+
+        self.assertEqual(cl.response_code, 403)
+        del(out[0])
+
+        # origin not set to allowed value
+        # prevents authenticated request like this from
+        # being shared with the requestor because
+        # Access-Control-Allow-Credentials is not
+        # set in response
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = " *  "
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'GET',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_ORIGIN': 'http://invalid.com',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://invalid.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1",
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                        }, form)
+        cl.db = self.db
+        self.db = cl.db # to close new db handle from main() at tearDown
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = {
+            'content-type': 'application/json',
+            'accept': 'application/json;version=1',
+            'origin': 'http://invalid.com',
+        }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from main() at tearDown
+        self.assertEqual(json.loads(b2s(out[0])),
+                         json.loads(expected)
+        )
+        self.assertNotIn('Access-Control-Allow-Credentials',
+                         cl.additional_headers)
+        self.assertIn('Access-Control-Allow-Origin',
+                      cl.additional_headers)
+        self.assertEqual(
+            h['origin'],
+            cl.additional_headers['Access-Control-Allow-Origin']
+        )
+
+        self.assertIn('Content-Length', cl.additional_headers)
+        del(out[0])
+
+
+        # CORS Same rules as for invalid origin
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'GET',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1",
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # Should return explanation because content type is text/plain
+        # and not text/xml
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from main() at tearDown
+        self.assertIn('Access-Control-Allow-Credentials',
+                      cl.additional_headers)
+
+        self.assertEqual(json.loads(b2s(out[0])),json.loads(expected))
+        del(out[0])
+
+        # origin set to special "null" value. Same rules as for
+        # invalid origin
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'GET',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_ORIGIN': 'null',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1",
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json',
+              'origin': 'null' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # Should return explanation because content type is text/plain
+        # and not text/xml
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from main() at tearDown
+        self.assertNotIn('Access-Control-Allow-Credentials', cl.additional_headers)
+
+        self.assertEqual(json.loads(b2s(out[0])),json.loads(expected))
+        del(out[0])
+
+
+    def testRestOptionsBadAttribute(self):
+        import json
+        out = []
+        def wh(s):
+            out.append(s)
+
+        # rest has no form content
+        form = cgi.FieldStorage()
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'OPTIONS',
+                            'HTTP_ORIGIN': 'http://whoami.com',
+                            'PATH_INFO':'rest/data/user/1/zot',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'content-type': ""
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = {
+            'origin': 'http://whoami.com',
+            'access-control-request-headers': 'x-requested-with',
+            'access-control-request-method': 'GET',
+            'referer': 'http://whoami.com/path',
+            'content-type': "",
+        }
+        cl.request.headers = MockNull(**h)
+
+        cl.write = wh # capture output
+        cl.handle_rest()
+        self.db = cl.db  # to close new db handle from handle_rest at tearDown
+
+        _py3 = sys.version_info[0] > 2
+
+        expected_headers = {
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, '
+                                 'X-Requested-With, X-HTTP-Method-Override',
+            'Access-Control-Allow-Methods': 'HEAD, OPTIONS, GET, POST, PUT, DELETE, PATCH',
+            'Access-Control-Expose-Headers': 'X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Limit-Period, Retry-After, Sunset, Allow',
+            'Access-Control-Allow-Origin': 'http://whoami.com',
+            'Access-Control-Max-Age': '86400',
+            'Allow': 'OPTIONS, GET, POST, PUT, DELETE, PATCH',
+            # string representation under python2 has an extra space.
+            'Content-Length': '104' if _py3 else '105',
+            'Content-Type': 'application/json',
+            'Vary': 'Origin'
+        }
+
+        expected_body = b'{\n    "error": {\n        "status": 404,\n        "msg": "Attribute zot not valid for Class user"\n    }\n}\n'
+
+        self.assertEqual(cl.response_code, 404)
+        # json payload string representation differs. Compare as objects.
+        self.assertEqual(json.loads(b2s(out[0])), json.loads(expected_body))
+        self.assertEqual(cl.additional_headers, expected_headers)
+
+        del(out[0])
+
+
+    def testRestOptionsRequestGood(self):
+        import json
+        out = []
+        def wh(s):
+            out.append(s)
+
+        # OPTIONS/CORS preflight has no credentials
+        # rest has no form content
+        form = cgi.FieldStorage()
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'OPTIONS',
+                            'HTTP_ORIGIN': 'http://whoami.com',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'Access-Control-Request-Headers': 'Authorization',
+                            'Access-Control-Request-Method': 'POST',
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = {
+            'origin': 'http://whoami.com',
+            'access-control-request-headers': 'Authorization',
+            'access-control-request-method': 'POST',
+            'referer': 'http://whoami.com/path',
+        }
+        cl.request.headers = MockNull(**h)
+
+        cl.write = wh # capture output
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from handle_rest at tearDown
+        self.assertEqual(out[0], '')  # 204 options returns no data
+
+        expected_headers = {
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, '
+                                 'X-Requested-With, X-HTTP-Method-Override',
+            'Access-Control-Allow-Methods': 'OPTIONS, GET, POST',
+            'Access-Control-Expose-Headers': 'X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Limit-Period, Retry-After, Sunset, Allow',
+            'Access-Control-Allow-Origin': 'http://whoami.com',
+            'Access-Control-Max-Age': '86400',
+            'Allow': 'OPTIONS, GET, POST',
+            'Content-Type': 'application/json',
+            'Vary': 'Origin'
+        }
+
+        self.assertEqual(cl.additional_headers, expected_headers)
+
+
+        del(out[0])
+
+    def testRestOptionsRequestBad(self):
+        import json
+
+        out = []
+        def wh(s):
+            out.append(s)
+
+        # OPTIONS/CORS preflight has no credentials
+        # rest has no form content
+        form = cgi.FieldStorage()
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'OPTIONS',
+                            'HTTP_ORIGIN': 'http://invalid.com',
+                            'PATH_INFO':'rest/data/issue',
+                            'HTTP_REFERER':
+                            'http://invalid.com/path/',
+                            'Access-Control-Request-Headers': 'Authorization',
+                            'Access-Control-Request-Method': 'POST',
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = {
+            'origin': 'http://invalid.com',
+            'access-control-request-headers': 'Authorization',
+            'access-control-request-method': 'POST',
+            'referer': 'http://invalid.com/path',
+        }
+        cl.request.headers = MockNull(**h)
+
+        cl.write = wh # capture output
+        cl.handle_rest()
+        self.db = cl.db # to close new db handle from handle_rest at tearDown
+
+        self.assertEqual(cl.response_code, 400)
+
+        del(out[0])
 
     def testRestCsrfProtection(self):
         import json
@@ -1089,7 +1658,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         cl._error_message = []
         cl.request = MockNull()
         h = { 'content-type': 'application/json',
-              'accept': 'application/json' }
+              'accept': 'application/json;version=1' }
         cl.request.headers = MockNull(**h)
                                       
         cl.write = wh # capture output
@@ -1097,7 +1666,8 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # Should return explanation because content type is text/plain
         # and not text/xml
         cl.handle_rest()
-        self.assertEqual(b2s(out[0]), "<class 'roundup.exceptions.UsageError'>: Required Header Missing\n")
+        self.assertEqual(b2s(out[0]), '{ "error": { "status": 400, '
+                         '"msg": "Required Header Missing" } }')
         del(out[0])
 
         cl = client.Client(self.instance, None,
@@ -1107,7 +1677,8 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
                             'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
                             'HTTP_REFERER': 'http://whoami.com/path/',
                             'HTTP_X_REQUESTED_WITH': 'rest',
-                            'HTTP_ACCEPT': "application/json;version=1"
+                            'HTTP_ACCEPT': "application/json;version=1",
+                            'HTTP_ORIGIN': 'http://whoami.com',
                         }, form)
         cl.db = self.db
         cl.base = 'http://whoami.com/path/'
@@ -1133,6 +1704,163 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         self.assertEqual(response,expected)
         del(out[0])
 
+
+        # rest has no form content
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = "https://bar.edu http://bar.edu"
+        form = cgi.FieldStorage()
+        form.list = [
+            cgi.MiniFieldStorage('title', 'A new issue'),
+            cgi.MiniFieldStorage('status', '1'),
+            cgi.MiniFieldStorage('@pretty', 'false'),
+            cgi.MiniFieldStorage('@apiver', '1'),
+        ]
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'POST',
+                            'PATH_INFO':'rest/data/issue',
+                            'CONTENT_TYPE': 'application/x-www-form-urlencoded',
+                            'HTTP_ORIGIN': 'https://bar.edu',
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1"
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # Should return explanation because content type is text/plain
+        # and not text/xml
+        cl.handle_rest()
+        answer='{"data": {"link": "http://tracker.example/cgi-bin/roundup.cgi/bugs/rest/data/issue/2", "id": "2"}}\n'
+        # check length to see if pretty is turned off.
+        self.assertEqual(len(out[0]), 99)
+
+        # compare as dicts not strings due to different key ordering
+        # between python versions.
+        response=json.loads(b2s(out[0]))
+        expected=json.loads(answer)
+        self.assertEqual(response,expected)
+        del(out[0])
+
+        #####
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'POST',
+                            'PATH_INFO':'rest/data/issue',
+                            'CONTENT_TYPE': 'application/x-www-form-urlencoded',
+                            'HTTP_ORIGIN': 'httxs://bar.edu',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'http://whoami.com/path/',
+                            'HTTP_ACCEPT': "application/json;version=1"
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # Should return explanation because content type is text/plain
+        # and not text/xml
+        cl.handle_rest()
+        self.assertEqual(b2s(out[0]), '{ "error": { "status": 400, "msg": "Client is not allowed to use Rest Interface." } }')
+        del(out[0])
+
+
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = "  * "
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'POST',
+                            'PATH_INFO':'rest/data/issue',
+                            'CONTENT_TYPE': 'application/x-www-form-urlencoded',
+                            'HTTP_ORIGIN': 'httxs://bar.edu',
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'httxp://bar.edu/path/',
+                            'HTTP_ACCEPT': "application/json;version=1"
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # create fourth issue
+        cl.handle_rest()
+        self.assertIn('"id": "3"', b2s(out[0]))
+        del(out[0])
+
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = "httxs://bar.foo.edu httxs://bar.edu"
+        for referer in [ 'httxs://bar.edu/path/foo',
+                         'httxs://bar.edu/path/foo?g=zz',
+                         'httxs://bar.edu']:
+            cl = client.Client(self.instance, None,
+                               {'REQUEST_METHOD':'POST',
+                                'PATH_INFO':'rest/data/issue',
+                                'CONTENT_TYPE': 'application/x-www-form-urlencoded',
+                                'HTTP_ORIGIN': 'httxs://bar.edu',
+                                'HTTP_X_REQUESTED_WITH': 'rest',
+                                'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                                'HTTP_REFERER': referer,
+                                'HTTP_ACCEPT': "application/json;version=1"
+                               }, form)
+            cl.db = self.db
+            cl.base = 'http://whoami.com/path/'
+            cl._socket_op = lambda *x : True
+            cl._error_message = []
+            cl.request = MockNull()
+            h = { 'content-type': 'application/json',
+                  'accept': 'application/json' }
+            cl.request.headers = MockNull(**h)
+            
+            cl.write = wh # capture output
+
+            # create fourth issue
+            cl.handle_rest()
+            self.assertIn('"id": "', b2s(out[0]))
+            del(out[0])
+        
+        cl.db.config.WEB_ALLOWED_API_ORIGINS = "httxs://bar.foo.edu httxs://bar.edu"
+        cl = client.Client(self.instance, None,
+                           {'REQUEST_METHOD':'POST',
+                            'PATH_INFO':'rest/data/issue',
+                            'CONTENT_TYPE': 'application/x-www-form-urlencoded',
+                            'HTTP_ORIGIN': 'httxs://bar.edu',
+                            'HTTP_X_REQUESTED_WITH': 'rest',
+                            'HTTP_AUTHORIZATION': 'Basic YWRtaW46YWRtaW4=',
+                            'HTTP_REFERER': 'httxp://bar.edu/path/',
+                            'HTTP_ACCEPT': "application/json;version=1"
+                        }, form)
+        cl.db = self.db
+        cl.base = 'http://whoami.com/path/'
+        cl._socket_op = lambda *x : True
+        cl._error_message = []
+        cl.request = MockNull()
+        h = { 'content-type': 'application/json',
+              'accept': 'application/json' }
+        cl.request.headers = MockNull(**h)
+                                      
+        cl.write = wh # capture output
+
+        # create fourth issue
+        cl.handle_rest()
+        self.assertEqual(b2s(out[0]), '{ "error": { "status": 400, "msg": "Invalid Referer: httxp://bar.edu/path/"}}')
+        del(out[0])
+
     def testXmlrpcCsrfProtection(self):
         # set the password for admin so we can log in.
         passwd=password.Password('admin')
@@ -1142,8 +1870,11 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         def wh(s):
             out.append(s)
 
-        # xmlrpc has no form content
-        form = {}
+        # create form for xmlrpc from string
+        form = db_test_base.makeFormFromString('xyzzy',
+                                               {"REQUEST_METHOD": "POST",
+                                               "CONTENT_TYPE": "text/json"})
+
         cl = client.Client(self.instance, None,
                            {'REQUEST_METHOD':'POST',
                             'PATH_INFO':'xmlrpc',
@@ -1214,6 +1945,8 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         if nodeid is not None:
             cl.nodeid = nodeid
         cl.db = self.db
+        cl.request = MockNull()
+        cl.db.Otk =  cl.db.getOTKManager()
         #cl.db.Otk = MockNull()
         #cl.db.Otk.data = {}
         #cl.db.Otk.getall = self.data_get
@@ -1240,7 +1973,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
             actions.EditItemAction(cl).handle)
 
     def testCheckAndPropertyPermission(self):
-        self.db.security.permissions = {}
+        self.db.security.permission = {}
         def own_record(db, userid, itemid):
             return userid == itemid
         p = self.db.security.addPermission(name='Edit', klass='user',
@@ -1271,7 +2004,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
     def testCreatePermission(self):
         # this checks if we properly differentiate between create and
         # edit permissions
-        self.db.security.permissions = {}
+        self.db.security.permission = {}
         self.db.security.addRole(name='UserAdd')
         # Don't allow roles
         p = self.db.security.addPermission(name='Create', klass='user',
@@ -1328,7 +2061,6 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
 
     def testSearchPermission(self):
         # this checks if we properly check for search permissions
-        self.db.security.permissions = {}
         self.db.security.addRole(name='User')
         self.db.security.addRole(name='Project')
         self.db.security.addPermissionToRole('User', 'Web Access')
@@ -1471,6 +2203,15 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         self.assertEqual(cl._ok_message, ['Items edited OK'])
         k = self.db.keyword.getnode('1')
         self.assertEqual(k.name, u2s(u'\xe4\xf6\xfc'))
+        form = dict(rows='id,name\n1,newkey\n\n2,newerkey\n\n')
+        cl = self._make_client(form, userid='1', classname='keyword')
+        cl._ok_message = []
+        actions.EditCSVAction(cl).handle()
+        self.assertEqual(cl._ok_message, ['Items edited OK'])
+        k = self.db.keyword.getnode('1')
+        self.assertEqual(k.name, 'newkey')
+        k = self.db.keyword.getnode('2')
+        self.assertEqual(k.name, 'newerkey')
 
     def testEditCSVTest(self):
 
@@ -1548,12 +2289,11 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # need to set SENDMAILDEBUG to prevent
         # downstream issue when email is sent on successful
         # issue creation. Also delete the file afterwards
-        # just tomake sure that someother test looking for
+        # just to make sure that some other test looking for
         # SENDMAILDEBUG won't trip over ours.
         if 'SENDMAILDEBUG' not in os.environ:
             os.environ['SENDMAILDEBUG'] = 'mail-test1.log'
         SENDMAILDEBUG = os.environ['SENDMAILDEBUG']
-
         
         # missing opaqueregister
         cl = self._make_client({'username':'new_user1', 'password':'secret',
@@ -1612,7 +2352,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # need to set SENDMAILDEBUG to prevent
         # downstream issue when email is sent on successful
         # issue creation. Also delete the file afterwards
-        # just tomake sure that someother test looking for
+        # just to make sure that some other test looking for
         # SENDMAILDEBUG won't trip over ours.
         if 'SENDMAILDEBUG' not in os.environ:
             os.environ['SENDMAILDEBUG'] = 'mail-test1.log'
@@ -1645,14 +2385,93 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         if os.path.exists(SENDMAILDEBUG):
             os.remove(SENDMAILDEBUG)
 
+    def testserve_static_files_cache_headers(self):
+        """Note for headers the real headers class is case
+           insensitive.
+        """
+        # make a client instance
+        cl = self._make_client({})
+        # Make local copy in cl to not modify value in class
+        cl.Cache_Control = copy.copy (cl.Cache_Control)
+
+        # TEMPLATES dir is searched by default. So this file exists.
+        # Check the returned values.
+        cl.serve_static_file("style.css")
+
+        # gather the conditional request headers from the 200 response
+        inm =  cl.additional_headers['ETag']
+        ims =  cl.additional_headers['Last-Modified']
+
+
+        # loop over all header value possibilities that will
+        # result in not modified.
+        for headers in [
+                {'if-none-match' : inm},
+                {'if-modified-since' : ims},
+                {'if-none-match' : inm, 'if-modified-since' : ims },
+                {'if-none-match' : inm, 'if-modified-since' : "fake" },
+                {'if-none-match' : "fake", 'if-modified-since' : ims },
+        ]:
+            print(headers)
+
+            # Request same file with if-modified-since header
+            # expect NotModified with same ETag and Last-Modified headers.
+            cl.request.headers = headers
+            cl.response_code = None
+            cl.additional_headers = {}
+
+            with self.assertRaises(NotModified) as cm:
+                cl.serve_static_file("style.css")
+
+            self.assertEqual(cm.exception.args, ())
+
+            self.assertEqual(cl.response_code, None)
+            self.assertEqual(cl.additional_headers['ETag'], inm)
+            self.assertEqual(cl.additional_headers['Last-Modified'], ims)
+
+
+        ## run two cases that should not return NotModified
+        for headers in [
+                {},
+                {'if-none-match' : "fake", 'if-modified-since' : "fake" },
+        ]:
+            cl.request.headers = headers
+            cl.response_code = None
+            cl.additional_headers = {}
+
+            cl.serve_static_file("style.css")
+
+            self.assertEqual(cl.response_code, None)
+            self.assertEqual(cl.additional_headers['ETag'], inm)
+            self.assertEqual(cl.additional_headers['Last-Modified'], ims)
+
+        ## test pure cgi case
+        # headers attribute does not exist
+        cl.request = None
+        cl.response_code = None
+        cl.additional_headers = {}
+
+        cl.env["HTTP_IF_MODIFIED_SINCE"] = ims
+
+        with self.assertRaises(NotModified) as cm:
+            cl.serve_static_file("style.css")
+
+        self.assertEqual(cm.exception.args, ())
+
+        self.assertEqual(cl.response_code, None)
+        self.assertEqual(cl.additional_headers['ETag'], inm)
+        self.assertEqual(cl.additional_headers['Last-Modified'], ims)
+
     def testserve_static_files(self):
         # make a client instance
         cl = self._make_client({})
+        # Make local copy in cl to not modify value in class
+        cl.Cache_Control = copy.copy (cl.Cache_Control)
 
         # hijack _serve_file so I can see what is found
         output = []
-        def my_serve_file(a, b, c, d):
-            output.append((a,b,c,d))
+        def my_serve_file(a, b, c, d, e):
+            output.append((a,b,c,d,e))
         cl._serve_file = my_serve_file
 
         # check case where file is not found.
@@ -1662,8 +2481,10 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # TEMPLATES dir is searched by default. So this file exists.
         # Check the returned values.
         cl.serve_static_file("issue.index.html")
-        self.assertEqual(output[0][1], "text/html")
-        self.assertEqual(output[0][3], "_test_cgi_form/html/issue.index.html")
+        print(output)
+        self.assertEqual(output[0][2], "text/html")
+        self.assertEqual(output[0][4],
+                         normpath('_test_cgi_form/html/issue.index.html'))
         del output[0] # reset output buffer
 
         # stop searching TEMPLATES for the files.
@@ -1675,8 +2496,9 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         # explicitly allow html directory
         cl.instance.config['STATIC_FILES'] = 'html -'
         cl.serve_static_file("issue.index.html")
-        self.assertEqual(output[0][1], "text/html")
-        self.assertEqual(output[0][3], "_test_cgi_form/html/issue.index.html")
+        self.assertEqual(output[0][2], "text/html")
+        self.assertEqual(output[0][4],
+                         normpath('_test_cgi_form/html/issue.index.html'))
         del output[0] # reset output buffer
 
         # set the list of files and do not look at the templates directory
@@ -1684,14 +2506,16 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
 
         # find file in first directory
         cl.serve_static_file("messagesummary.py")
-        self.assertEqual(output[0][1], "text/x-python")
-        self.assertEqual(output[0][3], "_test_cgi_form/detectors/messagesummary.py")
+        self.assertEqual(output[0][2], "text/x-python")
+        self.assertEqual(output[0][4],
+                         normpath( "_test_cgi_form/detectors/messagesummary.py"))
         del output[0] # reset output buffer
 
         # find file in second directory
         cl.serve_static_file("README.txt")
-        self.assertEqual(output[0][1], "text/plain")
-        self.assertEqual(output[0][3], "_test_cgi_form/extensions/README.txt")
+        self.assertEqual(output[0][2], "text/plain")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/extensions/README.txt"))
         del output[0] # reset output buffer
 
         # make sure an embedded - ends the searching.
@@ -1705,23 +2529,26 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         f = open('_test_cgi_form/detectors/README.txt', 'a').close()
         # find file now in first directory
         cl.serve_static_file("README.txt")
-        self.assertEqual(output[0][1], "text/plain")
-        self.assertEqual(output[0][3], "_test_cgi_form/detectors/README.txt")
+        self.assertEqual(output[0][2], "text/plain")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/detectors/README.txt"))
         del output[0] # reset output buffer
 
         cl.instance.config['STATIC_FILES'] = ' detectors extensions '
         # make sure lack of trailing - allows searching TEMPLATES
         cl.serve_static_file("issue.index.html")
-        self.assertEqual(output[0][1], "text/html")
-        self.assertEqual(output[0][3], "_test_cgi_form/html/issue.index.html")
+        self.assertEqual(output[0][2], "text/html")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/html/issue.index.html"))
         del output[0] # reset output buffer
 
         # Make STATIC_FILES a single element.
         cl.instance.config['STATIC_FILES'] = 'detectors'
         # find file now in first directory
         cl.serve_static_file("messagesummary.py")
-        self.assertEqual(output[0][1], "text/x-python")
-        self.assertEqual(output[0][3], "_test_cgi_form/detectors/messagesummary.py")
+        self.assertEqual(output[0][2], "text/x-python")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/detectors/messagesummary.py"))
         del output[0] # reset output buffer
 
         # make sure files found in subdirectory
@@ -1729,8 +2556,9 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         f = open('_test_cgi_form/detectors/css/README.css', 'a').close()
         # use subdir in filename
         cl.serve_static_file("css/README.css")
-        self.assertEqual(output[0][1], "text/css")
-        self.assertEqual(output[0][3], "_test_cgi_form/detectors/css/README.css")
+        self.assertEqual(output[0][2], "text/css")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/detectors/css/README.css"))
         del output[0] # reset output buffer
         
         cl.Cache_Control['text/css'] = 'public, max-age=3600'
@@ -1739,17 +2567,20 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         os.mkdir('_test_cgi_form/html/css')
         f = open('_test_cgi_form/html/css/README1.css', 'a').close()
         cl.serve_static_file("README1.css")
-        self.assertEqual(output[0][1], "text/css")
-        self.assertEqual(output[0][3], "_test_cgi_form/html/css/README1.css")
+        self.assertEqual(output[0][2], "text/css")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/html/css/README1.css"))
         self.assertTrue( "Cache-Control" in cl.additional_headers )
         self.assertEqual( cl.additional_headers,
                           {'Cache-Control': 'public, max-age=3600'} )
+        print(cl.additional_headers)
         del output[0] # reset output buffer
 
         cl.Cache_Control['README1.css'] = 'public, max-age=60'
         cl.serve_static_file("README1.css")
-        self.assertEqual(output[0][1], "text/css")
-        self.assertEqual(output[0][3], "_test_cgi_form/html/css/README1.css")
+        self.assertEqual(output[0][2], "text/css")
+        self.assertEqual(output[0][4],
+                         normpath("_test_cgi_form/html/css/README1.css"))
         self.assertTrue( "Cache-Control" in cl.additional_headers )
         self.assertEqual( cl.additional_headers,
                           {'Cache-Control': 'public, max-age=60'} )
@@ -1773,44 +2604,6 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         self.assertTrue(not item.hasRole(' '))
         self.db.user.set('1', roles='')
         self.assertTrue(not item.hasRole(''))
-
-    def testCSVExport(self):
-        cl = self._make_client(
-            {'@columns': 'id,title,status,keyword,assignedto,nosy'},
-            nodeid=None, userid='1')
-        cl.classname = 'issue'
-
-        demo_id=self.db.user.create(username='demo', address='demo@test.test',
-            roles='User', realname='demo')
-        key_id1=self.db.keyword.create(name='keyword1')
-        key_id2=self.db.keyword.create(name='keyword2')
-        self.db.issue.create(title='foo1', status='2', assignedto='4', nosy=['3',demo_id])
-        self.db.issue.create(title='bar2', status='1', assignedto='3', keyword=[key_id1,key_id2])
-        self.db.issue.create(title='baz32', status='4')
-        output = io.BytesIO()
-        cl.request = MockNull()
-        cl.request.wfile = output
-        # call export version that outputs names
-        actions.ExportCSVAction(cl).handle()
-        should_be=(s2b('"id","title","status","keyword","assignedto","nosy"\r\n'
-                       '"1","foo1","deferred","","Contrary, Mary","Bork, Chef;Contrary, Mary;demo"\r\n'
-                       '"2","bar2","unread","keyword1;keyword2","Bork, Chef","Bork, Chef"\r\n'
-                       '"3","baz32","need-eg","","",""\r\n'))
-        #print(should_be)
-        print(output.getvalue())
-        self.assertEqual(output.getvalue(), should_be)
-        output = io.BytesIO()
-        cl.request = MockNull()
-        cl.request.wfile = output
-        # call export version that outputs id numbers
-        actions.ExportCSVWithIdAction(cl).handle()
-        should_be = s2b('"id","title","status","keyword","assignedto","nosy"\r\n'
-                        "\"1\",\"foo1\",\"2\",\"[]\",\"4\",\"['3', '4', '5']\"\r\n"
-                        "\"2\",\"bar2\",\"1\",\"['1', '2']\",\"3\",\"['3']\"\r\n"
-                        '\"3\","baz32",\"4\","[]","None","[]"\r\n')
-        #print(should_be)
-        print(output.getvalue())
-        self.assertEqual(output.getvalue(), should_be)
 
     def testCSVExportCharset(self):
         cl = self._make_client(
@@ -1961,7 +2754,7 @@ class FormTestCase(FormTestParent, StringFragmentCmpHelper, unittest.TestCase):
         self.assertRaises(exceptions.Unauthorised,
             actions.ExportCSVWithIdAction(cl).handle)
 
-class TemplateHtmlRendering(unittest.TestCase):
+class TemplateHtmlRendering(unittest.TestCase, testFtsQuery):
     ''' try to test the rendering code for tal '''
     def setUp(self):
         self.dirname = '_test_template'
@@ -2020,6 +2813,61 @@ class TemplateHtmlRendering(unittest.TestCase):
         # page
         self.assertNotEqual(-1,
            self.output[0].index('<!-- SHA: c87a4e18d59a527331f1d367c0c6cc67ee123e63 -->'))
+
+    def testRenderError(self):
+        # set up the client;
+        # run determine_context to set the required client attributes
+        # run renderError(); check result for proper page
+
+        self.client.form=db_test_base.makeForm({})
+        self.client.path = ''
+        self.client.determine_context()
+
+        error = "Houston, we have a problem"
+
+
+        # template rendering will fail and return fallback html
+        out = self.client.renderError(error, 404)
+
+        expected_fallback = (
+            '\n<html><head><title>Roundup issue tracker: '
+            'An error has occurred</title>\n'
+            ' <link rel="stylesheet" type="text/css" href="@@file/style.css">\n'
+            '</head>\n'
+            '<body class="body" marginwidth="0" marginheight="0">\n'
+            ' <p class="error-message">Houston, we have a problem</p>\n'
+            '</body></html>\n')
+
+        self.assertEqual(out, expected_fallback)
+        self.assertIn(error, self.client._error_message)
+        self.assertEqual(self.client.response_code, 404)
+
+        ### next test
+        # Set this so template rendering works.
+        self.client.classname = 'issue'
+
+        out = self.client.renderError("Houston, we have a problem", 404)
+        # match hard coded line in 404 template
+        expected = ('There is no <span>issue</span> with id')
+        
+        self.assertIn(expected, out)
+        self.assertEqual(self.client.response_code, 404)
+
+
+        ### next test
+        # disable template use get fallback
+        out = self.client.renderError("Houston, we have a problem", 404,
+                                      use_template=False)
+        
+        self.assertEqual(out, expected_fallback)
+        self.assertEqual(self.client.response_code, 404)
+
+        ### next test
+        # no 400 template (default 2nd param) so we get fallback
+        out = self.client.renderError("Houston, we have a problem")
+        self.assertEqual(out, expected_fallback)
+        self.assertIn(error, self.client._error_message)
+        self.assertEqual(self.client.response_code, 400)
 
     def testrenderContext(self):
         # set up the client;
@@ -2089,9 +2937,42 @@ class TemplateHtmlRendering(unittest.TestCase):
         result = self.client.renderContext()
         print(result)
         # sha1sum of classic tracker user.item.template must be found
-        sha1sum = '<!-- SHA: 3b7ce7cbf24f77733c9b9f64a569d6429390cc3f -->'
+        sha1sum = '<!-- SHA: 952568414163cd12b2e89e91e59ef336da64fbbe -->'
         self.assertNotEqual(-1, result.index(sha1sum))
 
+    def testRenderAltTemplatesError(self):
+        # check that an error is reported to user when rendering using
+        #  @template=oktempl|errortmpl|oops|foo
+
+        # template names can not include |
+
+        # set up the client;
+        # run determine_context to set the required client attributes
+        # run renderContext(); check result for proper page
+
+        # Test ok state template that uses user.forgotten.html
+        self.client.form=db_test_base.makeForm({"@template": "forgotten|item|oops|foo"})
+        self.client.path = 'user'
+        self.client.determine_context()
+        self.client.session_api = MockNull(_sid="1234567890")
+        self.assertEqual(
+          (self.client.classname, self.client.template, self.client.nodeid),
+          ('user', 'forgotten|item|oops|foo', None))
+        self.assertEqual(self.client._ok_message, [])
+        
+        result = self.client.renderContext()
+        print(result)
+        # sha1sum of classic tracker user.forgotten.template must be found
+        sha1sum = '<!-- SHA: f93570f95f861da40f9c45bbd2b049bb3a7c0fc5 -->'
+        self.assertNotEqual(-1, result.index(sha1sum))
+
+        # now set an error in the form to get error template user.item.html
+        self.client.form=db_test_base.makeForm({"@template": "forgotten|item|oops|foo",
+                                   "@error_message": "this is an error"})
+        self.client.path = 'user'
+        self.client.determine_context()
+        result = self.client.renderContext()
+        self.assertEqual(result, '<strong>No template file exists for templating "user" with template "item|oops|foo" (neither "user.item|oops|foo" nor "_generic.item|oops|foo")</strong>')
 
     def testexamine_url(self):
         ''' test the examine_url function '''
@@ -2220,11 +3101,6 @@ class TemplateTestCase(unittest.TestCase):
         shutil.copyfile(self.dirname + "/html/user.item.html",
                         self.dirname + "/user.item.html")
 
-        # create link outside the html subdir. This should fail due to
-        # path traversal check.
-        os.symlink("../../user.item.html", subdir + "/user.item.html")
-        # it will be removed and replaced by a later test
-
         # make sure a simple non-subdir template works.
         # user.item.html exists so this works.
         # note that the extension is not included just the basename
@@ -2254,6 +3130,34 @@ class TemplateTestCase(unittest.TestCase):
         r = t.selectTemplate("issue", "subdir/item")
         self.assertEqual("subdir/issue.item", r)
 
+    def testTemplateSubdirectory_symlink(self):
+        # test for templates in subdirectories using symlinks.
+        # this doesn't work under windows unless you have special
+        # permissions
+
+        # make the directory
+        subdir = self.dirname + "/html/subdir"
+        os.mkdir(subdir)
+
+        # get the client instance The form is needed to initialize,
+        # but not used since I call selectTemplate directly.
+        t = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+         form=db_test_base.makeForm({"@template": "item"}))
+
+        # create link outside the html subdir. This should fail due to
+        # path traversal check.
+        try:
+            os.symlink("../../user.item.html", subdir + "/user.item.html")
+        except OSError as e:
+            # windows requires special privs for symbolic links
+            allowed_error = 'A required privilege is not held by the client'
+            if not e.args[1] == allowed_error:
+                raise
+            pytest.skip("User does not have permission to create symbolic links under Windows")
+
+        # it will be removed and replaced by a later test
+
         # there is a self.directory + /html/subdir/user.item.html file,
         # but it is a link to self.dir /user.item.html which is outside
         # the html subdir so is rejected by the path traversal check.
@@ -2272,5 +3176,562 @@ class TemplateTestCase(unittest.TestCase):
         # template check works
         r = t.selectTemplate("user", "subdir/item")
         self.assertEqual("subdir/user.item", r)
+
+class TemplateUtilsTestCase(unittest.TestCase):
+    ''' Test various TemplateUtils
+    '''
+    def setUp(self):
+        self.dirname = '_test_template'
+        # set up and open a tracker
+        self.instance = setupTracker(self.dirname)
+
+        # open the database
+        self.db = self.instance.open('admin')
+        self.db.tx_Source = "web"
+        self.db.user.create(username='Chef', address='chef@bork.bork.bork',
+            realname='Bork, Chef', roles='User')
+        self.db.user.create(username='mary', address='mary@test.test',
+            roles='User', realname='Contrary, Mary')
+        self.db.post_init()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            shutil.rmtree(self.dirname)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ESRCH): raise
+
+    @pytest.fixture(autouse=True)
+    def inject_fixtures(self, caplog):
+        self._caplog = caplog
+
+    def testReadfile(self):
+        # create new files in html dir
+        testfiles = [
+            { "name": "file_to_read.js",
+              "content": ('hello world'),
+            },
+            { # for future test expanding TAL
+              "name": "_generic.readfile_success.html",
+              "content": (
+
+                  '''<span tal:content="python:utils.readfile('''
+                  """'example.js')"></span>""" ),
+            },
+        ]
+
+        for file_spec in testfiles:
+            file_path = "%s/html/%s" % (self.dirname, file_spec['name'])
+            with open(file_path, "w") as f:
+                f.write(file_spec['content'])
+
+        # get the client instance The form is needed to initialize,
+        # but not used since I call selectTemplate directly.
+        t = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+         form=db_test_base.makeForm({"@template": "readfile_success"}))
+
+        tu = TemplatingUtils(t)
+        # testcase 1 - file exists
+        r = tu.readfile("file_to_read.js")
+        self.assertEqual(r, 'hello world')
+        r = None
+
+        # testcase 2 - file does not exist
+        with self.assertRaises(NoTemplate) as e:
+            r = tu.readfile("no_file_to_read.js")
+
+        self.assertEqual(
+            e.exception.args[0],
+            "Unable to read or expand file 'no_file_to_read.js' "
+            "in template 'home'.")
+        r = None
+
+        # testcase 3 - file does not exist - optional = True
+        r = tu.readfile("no_file_to_read.js", optional=True)
+        self.assertEqual(r, '')
+
+        # make sure a created template is found
+        # note that the extension is not included just the basename
+        self.assertEqual("_generic.readfile_success",
+                         t.selectTemplate("", "readfile_success"))
+
+
+        
+    def testExpandfile(self):
+        # test for templates in subdirectories
+
+        # remove when no longer supporting python 2
+        if not hasattr(self, 'assertRegex'):
+            self.assertRegex = self.assertRegexpMatches
+
+        # make the directory
+        subdir = self.dirname + "/html/subdir"
+        os.mkdir(subdir)
+
+        # create new files in html dir
+        testfiles = [
+            { "name": "file_to_read.js",
+              "content": ('hello world'),
+            },
+            { "name": "file_no_content.js",
+              "content": '',
+            },
+            { "name": "file_to_expand.js",
+              "content": ('hello world %(base)s'),
+            },
+            { "name": "file_with_broken_expand_type.js",
+              "content": ('hello world %(base)'),
+            },
+            { "name": "file_with_odd_token.js",
+              "content": ('hello world %(base)s, %(No,token)s'),
+            },
+            { "name": "file_with_missing.js",
+              "content": ('hello world %(base)s, %(idontexist)s'),
+            },
+            { "name": "file_with_bare_%.js",
+              "content": ('expr = 3 % 5 + (var1+var2)'),
+            },
+            { "name": "subdir/file_to_read.js",
+              "content": ('hello world from subdir'),
+            },
+            { # for future test expanding TAL
+              "name": "_generic.expandfile_success.html",
+              "content": (
+
+                  '''<span tal:content="python:utils.expandfile('''
+                  """'example.js', { 'No Token': "NT",
+                  "dict_token': 'DT'})"></span>""" ),
+            },
+        ]
+
+        for file_spec in testfiles:
+            file_path = "%s/html/%s" % (self.dirname, file_spec['name'])
+            with open(file_path, "w") as f:
+                f.write(file_spec['content'])
+
+        # get the client instance The form is needed to initialize,
+        # but not used since I call selectTemplate directly.
+        t = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+         form=db_test_base.makeForm({"@template": "readfile_success"}))
+
+        t.db = MockNull()
+        t.db.config = MockNull()
+        t.db.config.TRACKER_WEB = '_tracker_template'
+        tu = TemplatingUtils(t)
+
+        # testcase 1 - file exists
+        r = tu.expandfile("file_to_read.js")
+        self.assertEqual(r, 'hello world')
+        r = None
+
+        # testcase 2 - file does not exist
+        with self.assertRaises(NoTemplate) as e:
+            r = tu.expandfile("no_file_to_read.js")
+
+        self.assertEqual(
+            e.exception.args[0],
+            "Unable to read or expand file 'no_file_to_read.js' "
+            "in template 'home'.")
+        r = None
+
+        # testcase 3 - file does not exist - optional = True
+        r = tu.expandfile("no_file_to_read.js", optional=True)
+        self.assertEqual(r, '')
+        r = None
+
+        # testcase 4 - file is empty
+        r = tu.expandfile("file_no_content.js")
+        self.assertEqual(r, '')
+        r = None
+
+        # testcase 5 - behave like readfile (values = None)
+        r = tu.expandfile("file_to_expand.js")
+        self.assertEqual(r, "hello world %(base)s")
+        r = None
+
+        # testcase 6 - expand predefined
+        r = tu.expandfile("file_to_expand.js", {})
+        self.assertEqual(r, "hello world _tracker_template")
+        r = None
+
+        # testcase 7 - missing trailing type specifier
+        r = tu.expandfile("file_with_broken_expand_type.js", {})
+
+        self.assertEqual(r, "")
+
+        # self._caplog.record_tuples[0] - without line breaks
+        # ('roundup.template', 40, "Found an incorrect token when
+        # expandfile applied string subsitution on
+        # '/home/roundup/_test_template/html/file_with_broken_expand_type.js.
+        # ValueError('incomplete format') was raised. Check the format 
+        # of your named conversion specifiers."
+
+        # name used for logging
+        self.assertEqual(self._caplog.record_tuples[0][0], 'roundup.template')
+        # severity ERROR = 40
+        self.assertEqual(self._caplog.record_tuples[0][1], 40,
+                        msg="logging level != 40 (ERROR)")
+        # message. It includes a full path to the problem file, so Regex
+        # match the changable filename directory
+        self.assertRegex(self._caplog.record_tuples[0][2], (
+            r"^Found an incorrect token when expandfile applied "
+            r"string subsitution on "
+            r"'[^']*[\\/]_test_template[\\/]html[\\/]file_with_broken_expand_type.js'. "
+            r"ValueError\('incomplete format'\) was raised. Check the format "
+            r"of your named conversion specifiers."))
+        self._caplog.clear()
+        r = None
+
+        # testcase 8 - odd token. Apparently names are not identifiers
+        r = tu.expandfile("file_with_odd_token.js", {'No,token': 'NT'})
+
+        self.assertEqual(r, "hello world _tracker_template, NT")
+
+        # self._caplog.record_tuples[0] - without line breaks
+        # ('roundup.template', 40, "Found an incorrect token when
+        # expandfile applied string subsitution on
+        # '/home/roundup/_test_template/html/file_with_broken_expand_type.js.
+        # ValueError('incomplete format') was raised. Check the format 
+        # of your named conversion specifiers."
+
+        # no logs should be present
+        self.assertEqual(self._caplog.text, '')
+        r = None
+
+        # testcase 9 - key missing from values
+        r = tu.expandfile("file_with_missing.js", {})
+
+        self.assertEqual(r, "")
+
+        # self._caplog.record_tuples[0] - without line breaks
+        # ('roundup.template', 40, "Found an incorrect token when
+        # expandfile applied string subsitution on
+        # '/home/roundup/_test_template/html/file_with_broken_expand_type.js.
+        # ValueError('incomplete format') was raised. Check the format 
+        # of your named conversion specifiers."
+
+        # name used for logging
+        self.assertEqual(self._caplog.record_tuples[0][0], 'roundup.template')
+        # severity ERROR = 40
+        self.assertEqual(self._caplog.record_tuples[0][1], 40,
+                        msg="logging level != 40 (ERROR)")
+        # message. It includes a full path to the problem file, so Regex
+        # match the changable filename directory
+        self.assertRegex(self._caplog.record_tuples[0][2], (
+            r"When running "
+            r"expandfile\('[^']*[\\/]_test_template[\\/]html[\\/]file_with_missing.js'\) "
+            r"in 'home' there was no value for token: 'idontexist'."))
+        self._caplog.clear()
+        r = None
+
+        # testcase 10 - set key missing from values in test 8
+        r = tu.expandfile("file_with_missing.js", {'idontexist': 'I do exist'})
+
+        self.assertEqual(r, "hello world _tracker_template, I do exist")
+
+        # no logging
+        self.assertEqual(self._caplog.text, '')
+        self._caplog.clear()
+
+        # testcase 11 - handle a file with a bare % that raises TypeError
+        r = tu.expandfile("file_with_bare_%.js", {"var1": "bar"})
+        self.assertEqual(r, '')
+
+        # self._caplog.record_tuples[0] - without line breaks
+        # ('roundup.template', 40, "Found an incorrect token when
+        # expandfile applied string subsitution on
+        # '/home/roundup/_test_template/html/file_with_broken_expand_type.js.
+        # ValueError('incomplete format') was raised. Check the format 
+        # of your named conversion specifiers."
+
+        # name used for logging
+        self.assertEqual(self._caplog.record_tuples[0][0], 'roundup.template')
+        # severity ERROR = 40
+        self.assertEqual(self._caplog.record_tuples[0][1], 40,
+                        msg="logging level != 40 (ERROR)")
+        # message. It includes a full path to the problem file, so Regex
+        # match the changable filename directory
+        self.assertRegex(self._caplog.record_tuples[0][2], (
+            r"^Found an incorrect token when expandfile applied "
+            r"string subsitution on "
+            r"'[^']*[\\/]_test_template[\\/]html[\\/]file_with_bare_%.js'. "
+            r"ValueError\("
+            r"'unsupported format character ' ' \(0x20\) at index 12'\) was "
+            r"raised. Check the format "
+            r"of your named conversion specifiers."))
+        self._caplog.clear()
+        r = None
+
+        # testcase 12 - file exists in subdir
+        r = tu.expandfile("subdir/file_to_read.js")
+        self.assertEqual(r, 'hello world from subdir')
+        r = None
+
+
+        # make sure a created template is found
+        # note that the extension is not included just the basename
+        self.assertEqual("_generic.expandfile_success",
+                         t.selectTemplate("", "expandfile_success"))        
+
+
+class SqliteNativeFtsCgiTest(unittest.TestCase, testFtsQuery, testCsvExport):
+    """All of the rest of the tests use anydbm as the backend.
+       In addtion to normal fts test, this class tests renderError
+       when renderContext fails.
+       Triggering this error requires the native-fts backend for
+       the sqlite db.
+    """
+
+    def setUp(self):
+        self.dirname = '_test_template'
+        # set up and open a tracker
+        self.instance = setupTracker(self.dirname, backend="sqlite")
+
+        self.instance.config.INDEXER = "native-fts"
+
+        # open the database
+        self.db = self.instance.open('admin')
+        self.db.tx_Source = "web"
+        self.db.user.create(username='Chef', address='chef@bork.bork.bork',
+            realname='Bork, Chef', roles='User')
+        self.db.user.create(username='mary', address='mary@test.test',
+            roles='User', realname='Contrary, Mary')
+        self.db.post_init()
+
+        # create a client instance and hijack write_html
+        self.client = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+                form=db_test_base.makeForm({"@template": "item"}))
+
+        self.client._error_message = []
+        self.client._ok_message = []
+        self.client.db = self.db
+        self.client.userid = '1'
+        self.client.language = ('en',)
+        self.client.session_api = MockNull(_sid="1234567890")
+
+        self.output = []
+        # ugly hack to get html_write to return data here.
+        def html_write(s):
+            self.output.append(s)
+
+        # hijack html_write
+        self.client.write_html = html_write
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            shutil.rmtree(self.dirname)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ESRCH): raise
+
+    def testRenderContextBadFtsQuery(self):
+        # only test for sqlite
+        if self.db.dbtype not in [ "sqlite" ]:
+            pytest.skip("Not tested for backends without native FTS")
+
+        # generate a bad fts query
+        self.client.form=db_test_base.makeForm(
+            { "@ok_message": "ok message", "@template": "index",
+            "@search_text": "foo-bar"})
+        self.client.path = 'issue'
+        self.client.determine_context()
+
+        result = self.client.renderContext()
+
+        expected = '\n<html><head><title>Roundup issue tracker: An error has occurred</title>\n <link rel="stylesheet" type="text/css" href="@@file/style.css">\n</head>\n<body class="body" marginwidth="0" marginheight="0">\n <p class="error-message">Search failed. Try quoting any terms that include a \'-\' and retry the search.</p>\n</body></html>\n'
+
+        self.assertEqual(result, expected)
+        self.assertEqual(self.client.response_code, 400)
+
+        # handle outstanding commits since we are not using the
+        # standard entry points.
+        self.db.commit()
+
+    #
+    # SECURITY
+    #
+    # XXX test all default permissions
+    def _make_client(self, form, classname='user', nodeid='1',
+           userid='2', template='item'):
+        cl = client.Client(self.instance, None, {'PATH_INFO':'/',
+            'REQUEST_METHOD':'POST'}, db_test_base.makeForm(form))
+        cl.classname = classname
+        if nodeid is not None:
+            cl.nodeid = nodeid
+        cl.db = self.db
+        cl.db.Otk =  cl.db.getOTKManager()
+        #cl.db.Otk = MockNull()
+        #cl.db.Otk.data = {}
+        #cl.db.Otk.getall = self.data_get
+        #cl.db.Otk.set = self.data_set
+        cl.userid = userid
+        cl.language = ('en',)
+        cl._error_message = []
+        cl._ok_message = []
+        cl.template = template
+        return cl
+
+    def testCSVExportSearchError(self):
+        # test full text search
+        cl = self._make_client(
+            {'@columns': 'id,title,status,keyword,assignedto,nosy',
+             "@search_text": "foo + ^bar2"}, nodeid=None, userid='1')
+        cl.classname = 'issue'
+        output = io.BytesIO()
+        cl.request = MockNull()
+        cl.request.wfile = output
+
+        # note NotFound isn't quite right. however this exception
+        # passes up the stack to where it is handled with a suitable
+        # display of the error.
+        # call export version that outputs names
+        with self.assertRaises(NotFound) as cm:        
+            actions.ExportCSVAction(cl).handle()
+
+        # call export version that outputs id numbers
+        with self.assertRaises(NotFound) as cm:
+            actions.ExportCSVWithIdAction(cl).handle()
+
+        # commit changes so db can be properly closed on windows.
+        # because we are testing the backend method and not using
+        # cl.main() that handles db commit/close, we need to do this.
+        cl.db.commit()
+        
+class SqliteNativeCgiTest(unittest.TestCase, testFtsQuery):
+    """All of the rest of the tests use anydbm as the backend.
+       This class tests renderContext for fulltext search.
+       Run with sqlite and native indexer.
+    """
+
+    def setUp(self):
+        self.dirname = '_test_template'
+        # set up and open a tracker
+        self.instance = setupTracker(self.dirname, backend="sqlite")
+
+        self.instance.config.INDEXER = "native"
+
+        # open the database
+        self.db = self.instance.open('admin')
+        self.db.tx_Source = "web"
+
+        # create a client instance and hijack write_html
+        self.client = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+                form=db_test_base.makeForm({"@template": "item"}))
+
+        self.client._error_message = []
+        self.client._ok_message = []
+        self.client.db = self.db
+        self.client.userid = '1'
+        self.client.language = ('en',)
+        self.client.session_api = MockNull(_sid="1234567890")
+
+        self.output = []
+        # ugly hack to get html_write to return data here.
+        def html_write(s):
+            self.output.append(s)
+
+        # hijack html_write
+        self.client.write_html = html_write
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            shutil.rmtree(self.dirname)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ESRCH): raise
+
+@skip_postgresql
+class PostgresqlNativeCgiTest(unittest.TestCase, testFtsQuery):
+    """All of the rest of the tests use anydbm as the backend.
+       This class tests renderContext for fulltext search.
+       Run with postgresql and native indexer.
+    """
+
+    def setUp(self):
+        self.dirname = '_test_template'
+        # set up and open a tracker
+        self.instance = setupTracker(self.dirname, backend="postgresql")
+
+        self.instance.config.INDEXER = "native"
+
+        # open the database
+        self.db = self.instance.open('admin')
+        self.db.tx_Source = "web"
+
+        # create a client instance and hijack write_html
+        self.client = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+                form=db_test_base.makeForm({"@template": "item"}))
+
+        self.client._error_message = []
+        self.client._ok_message = []
+        self.client.db = self.db
+        self.client.userid = '1'
+        self.client.language = ('en',)
+        self.client.session_api = MockNull(_sid="1234567890")
+
+        self.output = []
+        # ugly hack to get html_write to return data here.
+        def html_write(s):
+            self.output.append(s)
+
+        # hijack html_write
+        self.client.write_html = html_write
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            shutil.rmtree(self.dirname)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ESRCH): raise
+
+@skip_mysql
+class MysqlNativeCgiTest(unittest.TestCase, testFtsQuery):
+    """All of the rest of the tests use anydbm as the backend.
+       This class tests renderContext for fulltext search.
+       Run with mysql and native indexer.
+    """
+
+    def setUp(self):
+        self.dirname = '_test_template'
+        # set up and open a tracker
+        self.instance = setupTracker(self.dirname, backend="mysql")
+
+        self.instance.config.INDEXER = "native"
+
+        # open the database
+        self.db = self.instance.open('admin')
+        self.db.tx_Source = "web"
+
+        # create a client instance and hijack write_html
+        self.client = client.Client(self.instance, "user",
+                {'PATH_INFO':'/user', 'REQUEST_METHOD':'POST'},
+                form=db_test_base.makeForm({"@template": "item"}))
+
+        self.client._error_message = []
+        self.client._ok_message = []
+        self.client.db = self.db
+        self.client.userid = '1'
+        self.client.language = ('en',)
+        self.client.session_api = MockNull(_sid="1234567890")
+
+        self.output = []
+        # ugly hack to get html_write to return data here.
+        def html_write(s):
+            self.output.append(s)
+
+        # hijack html_write
+        self.client.write_html = html_write
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            shutil.rmtree(self.dirname)
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ESRCH): raise
 
 # vim: set filetype=python sts=4 sw=4 et si :

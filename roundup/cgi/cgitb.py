@@ -7,13 +7,18 @@
 from __future__ import print_function
 __docformat__ = 'restructuredtext'
 
-import sys, os, keyword, linecache, tokenize, inspect
-import pydoc, traceback
+import inspect
+import keyword
+import linecache
+import os
+import pydoc
+import sys
+import tokenize
+import traceback
 
 from roundup.anypy.html import html_escape
-
-from roundup.cgi import TranslationService
 from roundup.anypy.strings import s2b
+from roundup.cgi import TranslationService
 
 
 def get_translator(i18n=None):
@@ -45,8 +50,8 @@ def niceDict(indent, dict):
     l = []
     for k in sorted(dict):
         v = dict[k]
-        l.append('<tr><td><strong>%s</strong></td><td>%s</td></tr>' % (k,
-            html_escape(repr(v))))
+        l.append('<tr><td><strong>%s</strong></td><td>%s</td></tr>' % (
+            k, html_escape(repr(v))))
     return '\n'.join(l)
 
 
@@ -62,7 +67,7 @@ def pt_html(context=5, i18n=None):
     from roundup.cgi.PageTemplates.Expressions import TraversalError
     t = inspect.trace(context)
     t.reverse()
-    for frame, file, lnum, func, lines, index in t:
+    for frame, _file, _lnum, _func, _lines, _index in t:
         args, varargs, varkw, locals = inspect.getargvalues(frame)
         if '__traceback_info__' in locals:
             ti = locals['__traceback_info__']
@@ -72,9 +77,10 @@ def pt_html(context=5, i18n=None):
                     s.append(_('<li>"%(name)s" (%(info)s)</li>')
                              % {'name': name, 'info': esc(repr(info))})
                 s = '\n'.join(s)
-                l.append(_('<li>Looking for "%(name)s", '
-                           'current path:<ol>%(path)s</ol></li>'
-                          ) % {'name': ti.name, 'path': s})
+                l.append(_(
+                    '<li>Looking for "%(name)s", '
+                    'current path:<ol>%(path)s</ol></li>'
+                ) % {'name': ti.name, 'path': s})
             else:
                 l.append(_('<li>In %s</li>') % esc(str(ti)))
         if '__traceback_supplement__' in locals:
@@ -98,10 +104,10 @@ def pt_html(context=5, i18n=None):
 </table></li>
 ''') % {
     'info': info,
-    'line': context.position[0],
+    'line': context.position[0] or -1,
     'globals': niceDict('    ', context.global_vars),
     'locals': niceDict('    ', context.local_vars)
-})
+   })
 
     l.append('''
 </ol>
@@ -121,10 +127,18 @@ def html(context=5, i18n=None):
     if type(etype) is type:
         etype = etype.__name__
     pyver = 'Python ' + sys.version.split()[0] + '<br>' + sys.executable
-    head = pydoc.html.heading(
-        _('<font size=+1><strong>%(exc_type)s</strong>: %(exc_value)s</font>')
-        % {'exc_type': etype, 'exc_value': evalue},
-        '#ffffff', '#777777', pyver)
+
+    if sys.version_info[0:2] >= (3,11):
+        head = pydoc.html.heading(
+            _('<font size=+1><strong>%(exc_type)s</strong>: '
+              '%(exc_value)s</font>')
+            % {'exc_type': etype, 'exc_value': evalue}, pyver)
+    else:
+        head = pydoc.html.heading(
+            _('<font size=+1><strong>%(exc_type)s</strong>: '
+              '%(exc_value)s</font>')
+            % {'exc_type': etype, 'exc_value': evalue},
+            '#ffffff', '#777777', pyver)
 
     head = head + (_('<p>A problem occurred while running a Python script. '
                      'Here is the sequence of function calls leading up to '
@@ -164,7 +178,7 @@ def html(context=5, i18n=None):
             if type == tokenize.NAME and token not in keyword.kwlist:
                 if token not in names:
                     names.append(token)
-            if type == tokenize.NEWLINE: raise IndexError
+            if type == tokenize.NEWLINE: raise IndexError       # noqa: E701
 
         def linereader(file=file, lnum=[lnum]):
             line = s2b(linecache.getline(file, lnum[0]))

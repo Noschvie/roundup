@@ -5,21 +5,28 @@
 #
 
 import os
-import weakref
-
 from contextlib import contextmanager
 
-from roundup.anypy.html import html_escape
-
 import roundup.instance
-from roundup.cgi import TranslationService
 from roundup.anypy import http_
+from roundup.anypy.html import html_escape
 from roundup.anypy.strings import s2b
-
+from roundup.cgi import TranslationService
 from roundup.cgi.client import BinaryFieldStorage
+from roundup.logcontext import gen_trace_id, store_trace_reason
 
 BaseHTTPRequestHandler = http_.server.BaseHTTPRequestHandler
 DEFAULT_ERROR_MESSAGE = http_.server.DEFAULT_ERROR_MESSAGE
+
+try:
+    # python2 is missing this definition
+    http_.server.BaseHTTPRequestHandler.responses[429]
+except KeyError:
+    http_.server.BaseHTTPRequestHandler.responses[429] = (
+         'Too Many Requests',
+        'The user has sent too many requests in '
+        'a given amount of time ("rate limiting")',
+    )
 
 
 class Headers(object):
@@ -46,7 +53,7 @@ class Headers(object):
 class Writer(object):
     '''Perform a start_response if need be when we start writing.'''
     def __init__(self, request):
-        self.request = request  #weakref.ref(request)
+        self.request = request  # weakref.ref(request)
 
     def write(self, data):
         f = self.request.get_wfile()
@@ -63,7 +70,7 @@ class RequestHandler(object):
 
     def start_response(self, headers, response_code):
         """Set HTTP response code"""
-        message, explain = BaseHTTPRequestHandler.responses[response_code]
+        message, _explain = BaseHTTPRequestHandler.responses[response_code]
         self.__wfile = self.__start_response('%d %s' % (response_code,
                                                         message), headers)
 
@@ -74,17 +81,34 @@ class RequestHandler(object):
 
 
 class RequestDispatcher(object):
-    def __init__(self, home, debug=False, timing=False, lang=None):
-        assert os.path.isdir(home), '%r is not a directory' % (home,)
+    def __init__(self, home, debug=False, timing=False, lang=None,
+                 feature_flags=None):
+        if not os.path.isdir(home):
+            raise ValueError('%r is not a directory' % (home,))
         self.home = home
         self.debug = debug
         self.timing = timing
+        self.feature_flags = feature_flags or {}
+        self.tracker = None
         if lang:
-            self.translator = TranslationService.get_translation(lang,
+            self.translator = TranslationService.get_translation(
+                lang,
                 tracker_home=home)
         else:
             self.translator = None
 
+        if self.use_cached_tracker():
+            self.tracker = roundup.instance.open(self.home, not self.debug)
+        else:
+            self.preload()
+
+    def use_cached_tracker(self):
+        return (
+            "cache_tracker" not in self.feature_flags or
+            self.feature_flags["cache_tracker"] is not False)
+
+    @gen_trace_id()
+    @store_trace_reason("wsgi")
     def __call__(self, environ, start_response):
         """Initialize with `apache.Request` object"""
         request = RequestHandler(environ, start_response)
@@ -97,8 +121,8 @@ class RequestDispatcher(object):
             else:
                 code = 501
                 message, explain = BaseHTTPRequestHandler.responses[code]
-                request.start_response([('Content-Type', 'text/html'),
-                                        ('Connection', 'close')], code)
+                request.start_response([('Content-Type', 'text/html')],
+                                       code)
                 request.wfile.write(s2b(DEFAULT_ERROR_MESSAGE % locals()))
                 return []
 
@@ -115,18 +139,33 @@ class RequestDispatcher(object):
         else:
             form = BinaryFieldStorage(fp=environ['wsgi.input'], environ=environ)
 
-        with self.get_tracker() as tracker:
-            client = tracker.Client(tracker, request, environ, form,
-                                    self.translator)
+        if self.use_cached_tracker():
+            client = self.tracker.Client(self.tracker, request, environ, form,
+                                         self.translator)
             try:
                 client.main()
             except roundup.cgi.client.NotFound:
                 request.start_response([('Content-Type', 'text/html')], 404)
-                request.wfile.write(s2b('Not found: %s' % 
+                request.wfile.write(s2b('Not found: %s' %
                                         html_escape(client.path)))
+        else:
+            with self.get_tracker() as tracker:
+                client = tracker.Client(tracker, request, environ, form,
+                                        self.translator)
+                try:
+                    client.main()
+                except roundup.cgi.client.NotFound:
+                    request.start_response([('Content-Type', 'text/html')], 404)
+                    request.wfile.write(s2b('Not found: %s' %
+                                            html_escape(client.path)))
 
         # all body data has been written using wfile
         return []
+
+    def preload(self):
+        """ Trigger pre-loading of imports and templates """
+        with self.get_tracker():
+            pass
 
     @contextmanager
     def get_tracker(self):

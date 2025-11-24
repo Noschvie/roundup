@@ -37,6 +37,7 @@ __docformat__ = 'restructuredtext'
 
 import gettext as gettext_module
 import os
+import sys
 
 from roundup import msgfmt
 from roundup.anypy.strings import is_us
@@ -51,12 +52,50 @@ LOCALE_DIRS = [
 # locale root is prefix/share/locale.
 if os.name == "nt":
     _mo_path = [".."] * 4 + ["share", "locale"]
+    root_prefix_chars = 3   # remove c:\ or other drive letter
 else:
     _mo_path = [".."] * 5 + ["share", "locale"]
+    root_prefix_chars = 1   # remove /
+
 _mo_path = os.path.normpath(os.path.join(msgfmt.__file__, *_mo_path))
 if _mo_path not in LOCALE_DIRS:
     LOCALE_DIRS.append(_mo_path)
 del _mo_path
+
+# __file__ should be something like:
+#    /usr/local/lib/python3.10/site-packages/roundup/i18n.py
+# os.prefix should be /usr, /usr/local or root of virtualenv
+#    strip leading / to make os.path.join work right.
+path = __file__
+
+for _N in 1, 2:  # remove roundup/i18n.py from path
+    path = os.path.dirname(path)
+    # path is /usr/local/lib/python3.10/site-packages
+
+_ldir = os.path.join(path, sys.prefix[root_prefix_chars:], 'share', 'locale')
+if os.path.isdir(_ldir):
+    LOCALE_DIRS.append(_ldir)
+
+# try other places locale files are hidden on install
+_ldir = os.path.join(path, sys.prefix[root_prefix_chars:], 'local', 'share', 'locale')
+if os.path.isdir(_ldir):
+    LOCALE_DIRS.append(_ldir)
+
+try:
+    _ldir = os.path.join(path, sys.base_prefix[root_prefix_chars:], 'local', 'share', 'locale')
+    if os.path.isdir(_ldir):
+        LOCALE_DIRS.append(_ldir)
+    _ldir = os.path.join(path, sys.base_prefix[root_prefix_chars:], 'share', 'locale')
+    if os.path.isdir(_ldir):
+        LOCALE_DIRS.append(_ldir)
+except AttributeError:
+    pass  # no base_prefix on 2.7
+
+# make -C locale local_install - locale directory in roundup source tree
+_ldir = os.path.join(path, 'locale', 'locale')
+if os.path.isdir(_ldir):
+    LOCALE_DIRS.append(_ldir)
+del _ldir
 
 # Roundup text domain
 DOMAIN = "roundup"
@@ -120,26 +159,20 @@ def get_mofile(languages, localedir, domain=None):
     for locale in languages:
         if locale == "C":
             break
-        if domain:
-            basename = os.path.join(localedir, locale, "LC_MESSAGES", domain)
-        else:
-            basename = os.path.join(localedir, locale)
+        basename = os.path.join(localedir, locale, "LC_MESSAGES", domain) if \
+            domain else os.path.join(localedir, locale)
         # look for message catalog files, check timestamps
         mofile = basename + ".mo"
-        if os.path.isfile(mofile):
-            motime = os.path.getmtime(mofile)
-        else:
-            motime = 0
+        motime = os.path.getmtime(mofile) if os.path.isfile(mofile) else 0
         pofile = basename + ".po"
-        if os.path.isfile(pofile):
-            potime = os.path.getmtime(pofile)
-        else:
-            potime = 0
+        potime = os.path.getmtime(pofile) if os.path.isfile(pofile) else 0
+
         # see what we've found
         if motime < potime:
             # compile
             mo = msgfmt.Msgfmt(pofile).get()
-            open(mofile, 'wb').write(mo)
+            with open(mofile, 'wb') as m:
+                m.write(mo)
         elif motime == 0:
             # no files found - proceed to the next locale name
             continue
@@ -163,38 +196,42 @@ def get_translation(language=None, tracker_home=None,
     """
     mofiles = []
     # locale directory paths
-    if tracker_home is None:
-        tracker_locale = None
-    else:
-        tracker_locale = os.path.join(tracker_home, "locale")
+    tracker_locale = os.path.join(tracker_home, "locale") if \
+        tracker_home is not None else None
+
     # get the list of locales
     locales = find_locales(language)
     # add mofiles found in the tracker, then in the system locale directory
     if tracker_locale:
         mofiles.append(get_mofile(locales, tracker_locale))
-    for system_locale in LOCALE_DIRS:
-        mofiles.append(get_mofile(locales, system_locale, DOMAIN))
+    mofiles.extend([get_mofile(locales, system_locale, DOMAIN)
+               for system_locale in LOCALE_DIRS])
+
     # we want to fall back to english unless english is selected language
     if "en" not in locales:
         locales = find_locales("en")
         # add mofiles found in the tracker, then in the system locale directory
         if tracker_locale:
             mofiles.append(get_mofile(locales, tracker_locale))
-        for system_locale in LOCALE_DIRS:
-            mofiles.append(get_mofile(locales, system_locale, DOMAIN))
+        mofiles.extend([get_mofile(locales, system_locale, DOMAIN)
+                         for system_locale in LOCALE_DIRS])
     # filter out elements that are not found
     mofiles = filter(None, mofiles)
     translator = None
     for mofile in mofiles:
         try:
-            mo = open(mofile, "rb")
-            if translator is None:
-                translator = translation_class(mo)
-            else:
-                # note: current implementation of gettext_module
-                #   always adds fallback to the end of the fallback chain.
-                translator.add_fallback(translation_class(mo))
-        except IOError:
+            with open(mofile, "rb") as mo:
+                if translator is None:
+                    translator = translation_class(mo)
+                    # the .mo file this translator loaded from
+                    translator._file = mofile
+                else:
+                    # note: current implementation of gettext_module
+                    #   always adds fallback to the end of the fallback chain.
+                    fallback = translation_class(mo)
+                    fallback._file = mofile
+                    translator.add_fallback(fallback)
+        except IOError:  # noqa: PERF203
             # ignore unreadable .mo files
             pass
     if translator is None:

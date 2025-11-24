@@ -63,7 +63,7 @@ __license__ = 'MIT'
 
 
 # The strftime format to use for <pubDate>s.
-RSS20_DATE_FORMAT = '%a, %d %b %Y %H:%M:%S %z'
+RSS20_DATE_FORMAT = '%a, %d %b %Y %H:%M:%S +0000'
 
 
 def newRss(title, link, description):
@@ -74,6 +74,7 @@ def newRss(title, link, description):
         root = rss.appendChild(rss.createElement("rss"))
         root.setAttribute("version", "2.0")
         root.setAttribute("xmlns:atom","http://www.w3.org/2005/Atom")
+        root.setAttribute("xmlns:dc","http://purl.org/dc/elements/1.1/")
 
         channel = root.appendChild(rss.createElement("channel"))
         addEl = lambda tag,value: channel.appendChild(rss.createElement(tag)).appendChild(rss.createTextNode(value))
@@ -111,10 +112,11 @@ def writeRss(db, cl, nodeid, olddata):
         filename = FILENAME % db.config.__dict__
 
         # return if issue is private
-        if ( db.issue.get(nodeid, 'private') ):
-                if __debug__:
-                        logger.debug("rss: Private issue. not generating rss")
-                return
+        # enable when private property is added
+        ##if ( db.issue.get(nodeid, 'private') ):
+        ##        if __debug__:
+        ##                logger.debug("rss: Private issue. not generating rss")
+        ##        return
 
         if __debug__:
                 logger.debug("rss: generating rss for issue %s", nodeid)
@@ -174,9 +176,11 @@ def writeRss(db, cl, nodeid, olddata):
                 addEl(item, 'comments', issuelink)
                 addEl(item, 'description', desc.replace('&','&amp;').replace('<','&lt;').replace('\n', '<br>\n'))
                 addEl(item, 'pubDate', date)
-                addEl(item, 'author',
-                        '%s (%s)' % (
-                                db.user.get(userid, 'address'),
+                # use dc:creator as username is not valid email address and
+                # author element must be valid email address
+                # addEl(item, 'author',
+                addEl(item, 'dc:creator',
+                        '%s' % (
                                 db.user.get(userid, 'username')
                         )
                 )
@@ -228,4 +232,4 @@ def writeRss(db, cl, nodeid, olddata):
 def init(db):
         db.issue.react('create', writeRss)
         db.issue.react('set', writeRss)
-#SHA: f4c0ccb5d0d9a6ef7829696333b33bc0619b0167
+#SHA: c4f916a13d533ff0c49386fc4f1f9f254adeb744

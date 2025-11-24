@@ -14,6 +14,7 @@ build
 demo
 dist
 MANIFEST
+roundup.egg-info
 _test_*
 *.cover
 share/doc/roundup/html
@@ -45,3 +46,5 @@ website/www/_tmp/
 website/www/COPYING.txt
 website/www/docs
 website/www/html/
+.pytest_cache
+.hypothesis

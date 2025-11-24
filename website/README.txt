@@ -1,42 +1,11 @@
 Roundup has three web sites:
 
  * https://www.roundup-tracker.org/
- * https://wiki.roundup-tracker.org/
  * https://issues.roundup-tracker.org/
+ * https://wiki.roundup-tracker.org/
 
-www and wiki are hosted on SourceForge.
-
-
-updating issues.roundup-tracker.org
-===================================
-See doc/developers.txt for details on accessing the new location.
-
-
-updating wiki.roundup-tracker.org
-=================================
-Wiki isn't hosted on sourceforge anymore. See:
-
- https://issues.roundup-tracker.org/issue2551045
-
-for details on Implementing wiki move to Waldmann-EDV.
-
-Bern Reiter will be adding new docs on how to update files (if
-possible). Old directions are:
-
-=============
-
-copy new files over to new directories:
-
-    cd ${project_home}/src/roundup/website/wiki
-    cp -r -p static/roundup ${project_home}/htdocs/_wiki/
-    cp -p wiki/data/plugin/theme/roundup.py ${project_home}/persistent/wiki/data/plugin/theme/
-    cd -
-
-If you need to adjust wiki configuration, it is here:
-
-    vim persistent/wiki/wikiconfig.py
-
-==============
+www is hosted on SourceForge, issues is hosted on a python software
+foundation host and wiki is hosted at waldman-edv.
 
 updating services hosted on sf.net (www)
 =================================================
@@ -61,8 +30,6 @@ http://web.archive.org/web/20140618231150/http://sourceforge.net/apps/trac/sourc
     project_home=/home/project-web/roundup
 
     # pull latest Roundup source with www and wiki
-    # (the warning about "Not trusting file ... " can be ignored
-    #  for now https://sourceforge.net/p/forge/site-support/8217/)
     hg pull -u --cwd ${project_home}/src/roundup
     # see below if this fails with: not trusting file
       # /home/project-web/roundup/src/roundup/.hg/hgrc from untrusted
@@ -71,6 +38,11 @@ http://web.archive.org/web/20140618231150/http://sourceforge.net/apps/trac/sourc
     # read up on other people changes and add yours
     cd ${project_home}
     vim logbuch.txt
+
+[ Note: all the files in the project home except htdocs that make up
+  the website were gone. I created a new logbuch.txt file. We need to
+  build the docs outside the sourceforge envirnment and rsync them in
+  as there is no longer a working sphinx environment. ]
 
 If you get a "not trusting" error the problem is that the .hg files in
 use are not owned by you and hg won't use them. Add this to your
@@ -90,6 +62,17 @@ to free resources:
 
 updating www.roundup-tracker.org
 ---------------------------------
+Note that sourceforge still only has python2 available on it's
+systems. Doc updates probably need to be done by building on local
+machine using modern Sphinx (7.x or greater) and the generated files
+pushed to the website.
+
+Also the files htdocs/ahref* and htdocs/google* have to be copied from
+the current production tree to the new directory so we keep some level
+of analytics.
+
+-----
+
 Site update requires rebuilding HTML files. For that
 `sphinx` is required/
 Hopefully, it is already installed into virtualenv, so
@@ -129,3 +112,110 @@ need to use:
   https://www.roundup-tracker.org/dev-docs/docs.html?foo=1
 
 to cache bust.
+
+Updating issues.roundup-tracker.org
+===================================
+
+The tracker resides on bugs.ams1.psf.io (188.166.48.69). You can also
+ssh to issues.roundup-tracker.org. They have the same fingerprint:
+
+    ED25519 key fingerprint is f1:f7:3d:bf:3b:01:8d:e1:4e:30:b3:0f:6e:98:b8:9b.
+
+The roundup installation belongs to the user roundup. 
+The setup uses virtualenv. Use the python version:
+
+  /srv/roundup/env/bin/python2.7
+
+to get a python with roundup on the PYTHONPATH.
+
+The Roundup tracker https://issues.roundup-tracker.org/ is in
+/srv/roundup/trackers/roundup/ with the database set to
+/srv/roundup/data/roundup/. Note that postgres is used for the
+backend, so the database directory above is used for msgs and files.
+
+Source is in: /srv/roundup/src/
+
+Roundup is run using gunicorn and wsgi.
+
+You have 'sudo -u roundup' access if you need to run things as the
+roundup user.
+
+The configuration is tracked in multiple places.
+The one used by PSF infrastrcuture is:
+
+   https://github.com/psf/bpo-tracker-roundup
+
+Contact ee-durbin (or psf infra) for an invite to their repo.
+
+Usually testing is done with: the "website/issues" section
+of Roundup's Mercurical SCM repository and copied manually to the live
+tracker.
+
+  * get a working copy of roundup/website/issues from the SCM, either via
+        hg clone https://hg.code.sf.net/p/roundup/code
+    or download a snapshot:
+        https://sourceforge.net/p/roundup/code/ci/default/tarball
+
+  * check the differences
+      diff -ur /srv/roundup/trackers/roundup/ roundup/website/issues/
+
+Copy differences using 'sudo -u roundup ...' into production for testing.
+
+Restart the server with:
+
+ sudo service roundup-roundup restart
+
+The git version is what PSF uses if they have to rebuild/move our
+tracker. So it's important to keep it up to date.
+
+They also generate the config.ini from an ansible script. So if you
+need to change settings in config.ini (e.g. logging from ERROR to
+WARNING) and have it persist across (daily+) ansible runs you need to
+update:
+
+ pillar/base/bugs.sls
+
+in the https://github.com/python/psf-salt repo and then push it.
+
+Getting a user account
+~~~~~~~~~~~~~~~~~~~~~~
+
+To get access to the host, submit a pull request for:
+
+    https://github.com/python/psf-salt
+
+by forking the repo, make a change similar to:
+
+    https://github.com/rouilj/psf-salt/commit/2aa55d0fc5a343f45f5507437d3fba077cbaf852
+
+and submit it as a pull request. Contact ewdurbin via #roundup IRC or by
+adding an issue to the master psf-salt repo.
+
+
+updating wiki.roundup-tracker.org
+=================================
+Wiki isn't hosted on sourceforge anymore. See:
+
+ https://issues.roundup-tracker.org/issue2551045
+
+for details on Implementing wiki move to Waldmann-EDV.
+
+Contact Thomas Waldmann. Web site: https://www.waldmann-edv.de/
+email: info AT waldmann-edv DOT de.
+
+The sites theme is under wiki/wiki/data/plugin/theme/roundup.py.  Last
+updated by emailing Thomas 2/2021. Images/icons and css under
+wiki/_static.
+
+Backups are assumed to be done by Waldmann-edv. There does not appear
+to be a way to get access to the underlying filesystem via ssh or to
+do a backup/tarball via with web.
+
+DNS
+===
+Thomas Waldman is also our DNS manager. All changes should go to him
+at email: info AT waldmann-edv DOT de.
+
+Richard Jones still owns/pays for the roundup-tracker.org domain.
+It expires on: 2026-01-06T10:49:58Z.
+

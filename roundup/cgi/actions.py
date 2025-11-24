@@ -1,33 +1,35 @@
-import re, cgi, time, csv, codecs, sys
+import codecs
+import csv
+import re
+import sys
+from datetime import timedelta
 
-from roundup import hyperdb, token, date, password
+from roundup import hyperdb, token_r, date, password
 from roundup.actions import Action as BaseAction
-from roundup.i18n import _
+from roundup.anypy import urllib_
+from roundup.anypy.cgi_ import cgi
+from roundup.anypy.html import html_escape
+from roundup.anypy.strings import StringIO
 from roundup.cgi import exceptions, templating
-from roundup.mailgw import uidFromAddress
-from roundup.rate_limit import Gcra, RateLimit
+from roundup.cgi.exceptions import RateLimitExceeded
 from roundup.cgi.timestamp import Timestamped
 from roundup.exceptions import Reject, RejectRaw
-from roundup.anypy import urllib_
-from roundup.anypy.strings import StringIO
-import roundup.anypy.random_ as random_
-
-from roundup.anypy.html import html_escape
-
-from datetime import timedelta
+from roundup.i18n import _
+from roundup.mailgw import uidFromAddress
+from roundup.rate_limit import Gcra, RateLimit
 
 # Also add action to client.py::Client.actions property
 __all__ = ['Action', 'ShowAction', 'RetireAction', 'RestoreAction',
            'SearchAction',
            'EditCSVAction', 'EditItemAction', 'PassResetAction',
            'ConfRegoAction', 'RegisterAction', 'LoginAction', 'LogoutAction',
-           'NewItemAction', 'ExportCSVAction', 'ExportCSVWithIdAction']
-
-# used by a couple of routines
-chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+           'NewItemAction', 'ExportCSVAction', 'ExportCSVWithIdAction',
+           'ReauthAction']
 
 
 class Action:
+    loginLimit = None
+
     def __init__(self, client):
         self.client = client
         self.form = client.form
@@ -39,8 +41,6 @@ class Action:
         self.base = client.base
         self.user = client.user
         self.context = templating.context(client)
-        self.loginLimit = RateLimit(client.db.config.WEB_LOGIN_ATTEMPTS_MIN,
-                                    timedelta(seconds=60))
 
     def handle(self):
         """Action handler procedure"""
@@ -75,18 +75,18 @@ class Action:
         validates:
 
         For each component, Appendix A of RFC 3986 says the following
-        are allowed:
+        are allowed::
 
-        pchar         = unreserved / pct-encoded / sub-delims / ":" / "@"
-        query         = *( pchar / "/" / "?" )
-        unreserved    = ALPHA / DIGIT / "-" / "." / "_" / "~"
-        pct-encoded   = "%" HEXDIG HEXDIG
-        sub-delims    = "!" / "$" / "&" / "'" / "(" / ")"
-                         / "*" / "+" / "," / ";" / "="
+          pchar         = unreserved / pct-encoded / sub-delims / ":" / "@"
+          query         = *( pchar / "/" / "?" )
+          unreserved    = ALPHA / DIGIT / "-" / "." / "_" / "~"
+          pct-encoded   = "%" HEXDIG HEXDIG
+          sub-delims    = "!" / "$" / "&" / "'" / "(" / ")"
+                           / "*" / "+" / "," / ";" / "="
 
         Checks all parts with a regexp that matches any run of 0 or
         more allowed characters. If the component doesn't validate,
-        raise ValueError. Don't attempt to urllib_.quote it. Either
+        raise ValueError. Don't attempt to ``urllib_.quote`` it. Either
         it's correct as it comes in or it's a ValueError.
 
         Finally paste the whole thing together and return the new url.
@@ -139,11 +139,11 @@ class Action:
         allowed_pattern = re.compile(r'''^[A-Za-z0-9@:/?._~%!$&'()*+,;=-]*$''')
 
         if not allowed_pattern.match(parsed_url_tuple.path):
-           raise ValueError(self._("Path component (%(url_path)s) in %(url)s "
-                                   "is not properly escaped") % info)
+            raise ValueError(self._("Path component (%(url_path)s) in %(url)s "
+                                    "is not properly escaped") % info)
 
         if not allowed_pattern.match(parsed_url_tuple.params):
-           raise ValueError(self._("Params component (%(url_params)s) in %(url)s is not properly escaped") % info)
+            raise ValueError(self._("Params component (%(url_params)s) in %(url)s is not properly escaped") % info)
 
         if not allowed_pattern.match(parsed_url_tuple.query):
             raise ValueError(self._("Query component (%(url_query)s) in %(url)s is not properly escaped") % info)
@@ -151,7 +151,7 @@ class Action:
         if not allowed_pattern.match(parsed_url_tuple.fragment):
             raise ValueError(self._("Fragment component (%(url_fragment)s) in %(url)s is not properly escaped") % info)
 
-        return(urllib_.urlunparse(parsed_url_tuple))
+        return urllib_.urlunparse(parsed_url_tuple)
 
     name = ''
     permissionType = None
@@ -243,7 +243,7 @@ class RetireAction(Action):
 
         # check permission
         if not self.hasPermission('Retire', classname=self.classname,
-                itemid=itemid):
+                                  itemid=itemid):
             raise exceptions.Unauthorised(self._(
                 'You do not have permission to retire %(class)s'
             ) % {'class': self.classname})
@@ -355,9 +355,10 @@ class SearchAction(Action):
                         if queryname != self.db.query.get(qid, 'name'):
                             continue
                         # whoops we found a duplicate; report error and return
-                        message = _("You already own a query named '%s'. "
-                                    "Please choose another name.") % \
-                                    (queryname)
+                        message = _(
+                            "You already own a query named '%s'. "
+                            "Please choose another name.") % (queryname)
+
                         self.client.add_error_message(message)
                         return
 
@@ -378,7 +379,7 @@ class SearchAction(Action):
                             continue
                         if not self.hasPermission('Edit', 'query', itemid=qid):
                             raise exceptions.Unauthorised(self._(
-                            "You do not have permission to edit queries"))
+                                "You do not have permission to edit queries"))
                         self.db.query.set(qid, klass=self.classname,
                                           url=url, name=queryname)
                 else:
@@ -428,11 +429,11 @@ class SearchAction(Action):
                 if isinstance(prop, hyperdb.String):
                     v = self.form[key].value
                     # If this ever has unbalanced quotes, hilarity will ensue
-                    l = token.token_split(v)
-                    if len(l) != 1 or l[0] != v:
+                    tokens = token_r.token_split(v)
+                    if len(tokens) != 1 or tokens[0] != v:
                         self.form.value.remove(self.form[key])
                         # replace the single value with the split list
-                        for v in l:
+                        for v in tokens:
                             self.form.value.append(cgi.MiniFieldStorage(key, v))
                 elif isinstance(prop, hyperdb.Number):
                     try:
@@ -464,7 +465,7 @@ class SearchAction(Action):
         different from 'index'
         """
         template = self.getFromForm('template')
-        if template and template != 'index':
+        if template and template not in ['index', 'index|search']:
             return req.indexargs_url('', {'@template': template})[1:]
         return req.indexargs_url('', {})[1:]
 
@@ -509,9 +510,13 @@ class EditCSVAction(Action):
         line = 0
         for values in reader:
             line += 1
-            if line == 1: continue
+            if line == 1: continue                                # noqa: E701
             # skip property names header
             if values == props:
+                continue
+            # skip blank lines. Can be in the middle
+            # of the data or a newline at end of file.
+            if len(values) == 0:
                 continue
 
             # extract the itemid
@@ -538,8 +543,8 @@ class EditCSVAction(Action):
             # confirm correct weight
             if len(props_without_id) != len(values):
                 self.client.add_error_message(
-                    self._('Not enough values on line %(line)s') % \
-                    {'line':line})
+                    self._('Not enough values on line %(line)s') % {
+                        'line': line})
                 return
 
             # extract the new values
@@ -547,7 +552,8 @@ class EditCSVAction(Action):
             for name, value in zip(props_without_id, values):
                 # check permission to edit this property on this item
                 if exists and not self.hasPermission('Edit', itemid=itemid,
-                                     classname=self.classname, property=name):
+                                                     classname=self.classname,
+                                                     property=name):
                     raise exceptions.Unauthorised(self._(
                         'You do not have permission to edit %(class)s'
                     ) % {'class': self.classname})
@@ -657,8 +663,13 @@ class EditCommon(Action):
             cn, nodeid = needed
             if props:
                 if nodeid is not None and int(nodeid) > 0:
-                    # make changes to the node
-                    props = self._changenode(cn, nodeid, props)
+                    # make changes to the node, if an error occurs the
+                    # db may be in a state that needs rollback
+                    try:
+                        props = self._changenode(cn, nodeid, props)
+                    except (IndexError, ValueError):
+                        self.db.rollback ()
+                        raise
 
                     # and some nice feedback for the user
                     if props:
@@ -809,10 +820,12 @@ class EditItemAction(EditCommon):
             return []
 
     def handleCollision(self, props):
-        message = self._('Edit Error: someone else has edited this %s (%s). '
-            'View <a target="_blank" href="%s%s">their changes</a> '
-            'in a new window.') % (self.classname, ', '.join(props),
-                                   self.classname, self.nodeid)
+        message = self._(
+            'Edit Error: someone else has edited this %(klass)s (%(props)s). '
+            'View <a target="_blank" href="%(klass)s%(id)s">their changes</a> '
+            'in a new window.') % {"klass": self.classname,
+                                   "props": ', '.join(props),
+                                   "id": self.nodeid}
         self.client.add_error_message(message, escape=False)
         return
 
@@ -963,12 +976,12 @@ class PassResetAction(Action):
 
             # send the email
             tracker_name = self.db.config.TRACKER_NAME
-            subject = 'Password reset for %s' % tracker_name
-            body = '''
+            subject = self._('Password reset for %s') % tracker_name
+            body = self._('''
 The password has been reset for username "%(name)s".
 
 Your password is now: %(password)s
-''' % {'name': name, 'password': newpw}
+''') % {'name': name, 'password': newpw}
             if not self.client.standard_message([address], subject, body):
                 return
 
@@ -999,16 +1012,15 @@ Your password is now: %(password)s
             return
 
         # generate the one-time-key and store the props for later
-        otk = ''.join([random_.choice(chars) for x in range(32)])
-        while otks.exists(otk):
-            otk = ''.join([random_.choice(chars) for x in range(32)])
+        otk = otks.getUniqueKey(length=32)
+
         otks.set(otk, uid=uid, uaddress=address)
         otks.commit()
 
         # send the email
         tracker_name = self.db.config.TRACKER_NAME
-        subject = 'Confirm reset of password for %s' % tracker_name
-        body = '''
+        subject = self._('Confirm reset of password for %s') % tracker_name
+        body = self._('''
 Someone, perhaps you, has requested that the password be changed for your
 username, "%(name)s". If you wish to proceed with the change, please follow
 the link below:
@@ -1016,7 +1028,7 @@ the link below:
   %(url)suser?@template=forgotten&@action=passrst&otk=%(otk)s
 
 You should then receive another email with the new password.
-''' % {'name': name, 'tracker': tracker_name, 'url': self.base, 'otk': otk}
+''') % {'name': name, 'tracker': tracker_name, 'url': self.base, 'otk': otk}
         if not self.client.standard_message([address], subject, body):
             return
 
@@ -1049,7 +1061,7 @@ class RegoCommon(Action):
             <script nonce="%s" type="text/javascript">
             window.setTimeout('window.location = "%s"', 1000);
             </script>''' % (message, url, message,
-                          self.client.client_nonce, url)
+                            self.client.client_nonce, url)
 
 
 class ConfRegoAction(RegoCommon):
@@ -1100,7 +1112,8 @@ class RegisterAction(RegoCommon, EditCommon, Timestamped):
             # handle the create now
             try:
                 # when it hits the None element, it'll set self.nodeid
-                messages = self._editnodes(props, links)
+                # execute for side effect
+                messages = self._editnodes(props, links)   # noqa: F841
             except (ValueError, KeyError, IndexError, Reject) as message:
                 escape = not isinstance(message, RejectRaw)
                 # these errors might just be indicative of user dumbness
@@ -1125,7 +1138,9 @@ class RegisterAction(RegoCommon, EditCommon, Timestamped):
         check_user = self.db.config['WEB_REGISTRATION_PREVALIDATE_USERNAME']
         if check_user:
             try:
-                user_found = self.db.user.lookup(user_props['username'])
+                # verify user exists
+                user_found = self.db.user.lookup(user_props['username']) \
+                             # noqa: F841
                 # if user is found reject the request.
                 raise Reject(
                     _("Username '%s' is already used.") % user_props['username'])
@@ -1144,18 +1159,19 @@ class RegisterAction(RegoCommon, EditCommon, Timestamped):
             elif isinstance(proptype, hyperdb.Password):
                 user_props[propname] = str(value)
         otks = self.db.getOTKManager()
-        otk = ''.join([random_.choice(chars) for x in range(32)])
-        while otks.exists(otk):
-            otk = ''.join([random_.choice(chars) for x in range(32)])
+        otk = otks.getUniqueKey(length=32)
         otks.set(otk, **user_props)
 
         # send the email
         tracker_name = self.db.config.TRACKER_NAME
         tracker_email = self.db.config.TRACKER_EMAIL
         if self.db.config['EMAIL_REGISTRATION_CONFIRMATION']:
-            subject = 'Complete your registration to %s -- key %s' % (
-                tracker_name, otk)
-            body = """To complete your registration of the user "%(name)s" with
+            subject = _(
+                'Complete your registration to %(tracker_name)s -- key %(key)s') % {
+                    'tracker_name': tracker_name,
+                    'key': otk}
+
+            body = _("""To complete your registration of the user "%(name)s" with
 %(tracker)s, please do one of the following:
 
 - send a reply to %(tracker_email)s and maintain the subject line as is (the
@@ -1165,17 +1181,18 @@ reply's additional "Re:" is ok),
 
 %(url)s?@action=confrego&otk=%(otk)s
 
-""" % {'name': user_props['username'], 'tracker': tracker_name,
-       'url': self.base, 'otk': otk, 'tracker_email': tracker_email}
+""") % {'name': user_props['username'], 'tracker': tracker_name,
+        'url': self.base, 'otk': otk, 'tracker_email': tracker_email}  \
+        # noqa: E122
         else:
-            subject = 'Complete your registration to %s' % (tracker_name)
-            body = """To complete your registration of the user "%(name)s" with
+            subject = _('Complete your registration to %s') % (tracker_name)
+            body = _("""To complete your registration of the user "%(name)s" with
 %(tracker)s, please visit the following URL:
 
 %(url)s?@action=confrego&otk=%(otk)s
 
-""" % {'name': user_props['username'], 'tracker': tracker_name,
-       'url': self.base, 'otk': otk}
+""") % {'name': user_props['username'], 'tracker': tracker_name,
+            'url': self.base, 'otk': otk}  # noqa: E122
         if not self.client.standard_message([user_props['address']], subject,
                                             body,
                                             (tracker_name, tracker_email)):
@@ -1279,45 +1296,15 @@ class LoginAction(Action):
                 query = {}
                 pass
 
-            redirect_url = urllib_.urlunparse((redirect_url_tuple.scheme,
-                                               redirect_url_tuple.netloc,
-                                               redirect_url_tuple.path,
-                                               redirect_url_tuple.params,
-                                               urllib_.urlencode(list(sorted(query.items())), doseq=True),
-                                               redirect_url_tuple.fragment)
-            )
+            redirect_url = urllib_.urlunparse(
+                (redirect_url_tuple.scheme,
+                 redirect_url_tuple.netloc,
+                 redirect_url_tuple.path,
+                 redirect_url_tuple.params,
+                 urllib_.urlencode(list(sorted(query.items())), doseq=True),
+                 redirect_url_tuple.fragment))
 
         try:
-            # Implement rate limiting of logins by login name.
-            # Use prefix to prevent key collisions maybe??
-            # set client.db.config.WEB_LOGIN_ATTEMPTS_MIN to 0
-            #  to disable
-            if self.client.db.config.WEB_LOGIN_ATTEMPTS_MIN:  # if 0 - off
-                rlkey = "LOGIN-" + self.client.user
-                limit = self.loginLimit
-                gcra = Gcra()
-                otk = self.client.db.Otk
-                try:
-                    val = otk.getall(rlkey)
-                    gcra.set_tat_as_string(rlkey, val['tat'])
-                except KeyError:
-                    # ignore if tat not set, it's 1970-1-1 by default.
-                    pass
-                # see if rate limit exceeded and we need to reject the attempt
-                reject = gcra.update(rlkey, limit)
-
-                # Calculate a timestamp that will make OTK expire the
-                # unused entry 1 hour in the future
-                ts = time.time() - (60 * 60 * 24 * 7) + 3600
-                otk.set(rlkey, tat=gcra.get_tat_as_string(rlkey),
-                        __timestamp=ts)
-                otk.commit()
-
-                if reject:
-                    # User exceeded limits: find out how long to wait
-                    status = gcra.status(rlkey, limit)
-                    raise Reject(_("Logins occurring too fast. Please wait: %s seconds.") % status['Retry-After'])
-
             self.verifyLogin(self.client.user, password)
         except exceptions.LoginError as err:
             self.client.make_user_anonymous()
@@ -1327,16 +1314,38 @@ class LoginAction(Action):
             if '__came_from' in self.form:
                 # set a new error
                 query['@error_message'] = err.args
-                redirect_url = urllib_.urlunparse((redirect_url_tuple.scheme,
-                                                   redirect_url_tuple.netloc,
-                                                   redirect_url_tuple.path,
-                                                   redirect_url_tuple.params,
-                                                   urllib_.urlencode(list(sorted(query.items())), doseq=True),
-                                                   redirect_url_tuple.fragment )
-                )
+                redirect_url = urllib_.urlunparse(
+                    (redirect_url_tuple.scheme,
+                     redirect_url_tuple.netloc,
+                     redirect_url_tuple.path,
+                     redirect_url_tuple.params,
+                     urllib_.urlencode(list(sorted(query.items())), doseq=True),
+                     redirect_url_tuple.fragment))
                 raise exceptions.Redirect(redirect_url)
             # if no __came_from, send back to base url with error
             return
+        except RateLimitExceeded as err:
+            self.client.make_user_anonymous()
+            for arg in err.args:
+                self.client.add_error_message(arg)
+
+            if '__came_from' in self.form:
+                #  usually web only. If API uses this they will get
+                #  confused as the 429 isn't returned. Without this
+                #  a web user will get redirected back to the home
+                # page rather than stay on the page where they tried
+                # to login.
+                # set a new error message
+                query['@error_message'] = err.args
+                redirect_url = urllib_.urlunparse(
+                    (redirect_url_tuple.scheme,
+                     redirect_url_tuple.netloc,
+                     redirect_url_tuple.path,
+                     redirect_url_tuple.params,
+                     urllib_.urlencode(list(sorted(query.items())), doseq=True),
+                     redirect_url_tuple.fragment))
+                raise exceptions.Redirect(redirect_url)
+            raise
 
         # now we're OK, re-open the database for real, using the user
         self.client.opendb(self.client.user)
@@ -1348,17 +1357,179 @@ class LoginAction(Action):
 
         # If we came from someplace, go back there
         if '__came_from' in self.form:
+            # add welcome message to user when logged in
+            query['@ok_message'] = _("Welcome %(username)s!") % {
+                "username": self.client.user, }
+            redirect_url = urllib_.urlunparse((redirect_url_tuple.scheme,
+                                               redirect_url_tuple.netloc,
+                                               redirect_url_tuple.path,
+                                               redirect_url_tuple.params,
+                                               urllib_.urlencode(list(sorted(query.items())), doseq=True),
+                                               redirect_url_tuple.fragment))
+
             raise exceptions.Redirect(redirect_url)
 
-    def verifyLogin(self, username, password):
+    def rateLimitLogin(self, username, is_api=False, update=True):
+        """Implement rate limiting of logins by login name.
+
+           username - username attempting to log in. May or may not
+                      be valid.
+           is_api - set to False for login via html page
+                    set to "xmlrpc" for xmlrpc api
+                    set to "rest" for rest api
+           update - if False will raise RateLimitExceeded without
+                    updating the stored value. Default is True
+                    which updates stored value. Used to deny access
+                    when user successfully logs in but the user
+                    doesn't have a valid attempt available.
+
+           Login rates for a user are split based on html vs api
+           login.
+
+           Set self.client.db.config.WEB_LOGIN_ATTEMPTS_MIN to 0
+           to disable for web interface. Set
+           self.client.db.config.API_LOGIN_ATTEMPTS to 0
+           to disable for web interface.
+
+           By setting LoginAction.limitLogin, the admin can override
+           the HTML web page rate limiter if they need to change the
+           interval from 1 minute.
+        """
+        config = self.client.db.config
+
+        if not is_api:
+            # HTML web login. Period is fixed at 1 minute.
+            # Override by setting self.loginLimit. Yech.
+            allowed_attempts = config.WEB_LOGIN_ATTEMPTS_MIN
+            per_period = 60
+            rlkey = "LOGIN-" + username
+        else:
+            # api login. Both Rest and XMLRPC use this.
+            allowed_attempts = config.WEB_API_FAILED_LOGIN_LIMIT
+            per_period = config.WEB_API_FAILED_LOGIN_INTERVAL_IN_SEC
+            rlkey = "LOGIN-API" + username
+
+        if not allowed_attempts:  # if allowed_attempt == 0 - off
+            return
+
+        if self.loginLimit and not is_api:
+            # provide a way for user (via interfaces.py) to
+            # change the interval on the html login limit.
+            limit = self.loginLimit
+        else:
+            limit = RateLimit(allowed_attempts,
+                              timedelta(seconds=per_period))
+
+            gcra = Gcra()
+            otk = self.client.db.Otk
+
+            try:
+                val = otk.getall(rlkey)
+                gcra.set_tat_as_string(rlkey, val['tat'])
+            except KeyError:
+                # ignore if tat not set, tat is 1970-1-1 by default.
+                pass
+
+            # see if rate limit exceeded and we need to reject
+            # the attempt
+            reject = gcra.update(rlkey, limit)
+
+            # Calculate a timestamp that will make OTK expire the
+            # unused entry in twice the period defined for the
+            # rate limiter.
+            if update:
+                ts = otk.lifetime(per_period*2)
+                otk.set(rlkey, tat=gcra.get_tat_as_string(rlkey),
+                        __timestamp=ts)
+                otk.commit()
+
+            # User exceeded limits: find out how long to wait
+            limitStatus = gcra.status(rlkey, limit)
+
+            if not reject:
+                return
+
+            for header, value in limitStatus.items():
+                self.client.setHeader(header, value)
+
+            # User exceeded limits: tell humans how long to wait
+            # Headers above will do the right thing for api
+            # aware clients.
+            try:
+                retry_after = limitStatus['Retry-After']
+            except KeyError:
+                # handle race condition. If the time between
+                # the call to grca.update and grca.status
+                # is sufficient to reload the bucket by 1
+                # item, Retry-After will be missing from
+                # limitStatus. So report a 1 second delay back
+                # to the client. We treat update as sole
+                # source of truth for exceeded rate limits.
+                retry_after = 1
+                self.client.setHeader('Retry-After', '1')
+
+            # make rate limiting headers available to javascript
+            # even for non-api calls.
+            self.client.setHeader(
+                "Access-Control-Expose-Headers",
+                ", ".join([
+                    "X-RateLimit-Limit",
+                    "X-RateLimit-Remaining",
+                    "X-RateLimit-Reset",
+                    "X-RateLimit-Limit-Period",
+                    "Retry-After"
+                ])
+            )
+
+            raise RateLimitExceeded(_("Logins occurring too fast. Please wait: %s seconds.") % retry_after)
+
+    def verifyLogin(self, username, password, is_api=False):
+        """Authenticate the user with rate limits.
+
+           All logins (valid and failing) from a web page calling the
+           LoginAction method are rate limited to the config.ini
+           configured value in 1 minute. (Interval can be changed see
+           rateLimitLogin method.)
+
+           API logins are only rate limited if they fail. Successful
+           api logins are rate limited using the
+           api_calls_per_interval and api_interval_in_sec settings in
+           config.ini.
+
+           Once a user receives a rate limit notice, they must
+           wait the recommended time to try again as the account is
+           locked out for the recommended time. If a user tries to
+           log in while locked out, they will get a 429 rejection
+           even if the username and password are correct.
+        """
         # make sure the user exists
         try:
+            # Note: lookup only searches non-retired items.
             self.client.userid = self.db.user.lookup(username)
         except KeyError:
+            # Perform password check against anonymous user.
+            # Prevents guessing of valid usernames by detecting
+            # delay caused by checking password only on valid
+            # users.
+            _discard = self.verifyPassword("2", password)          # noqa: F841
+
+            # limit logins to an acceptable rate. Do it for
+            # invalid usernames so attempts to break
+            # an invalid user will also be rate limited.
+            self.rateLimitLogin(username, is_api=is_api)
+
+            # this is not hit if rate limit is exceeded
             raise exceptions.LoginError(self._('Invalid login'))
+
+        # if we are rate limited and the user tries again,
+        # reject the login. update=false so we don't count
+        # a potentially valid login.
+        self.rateLimitLogin(username, is_api=is_api, update=False)
 
         # verify the password
         if not self.verifyPassword(self.client.userid, password):
+            self.rateLimitLogin(username, is_api=is_api)
+            # this is not hit if rate limit is exceeded
             raise exceptions.LoginError(self._('Invalid login'))
 
         # Determine whether the user has permission to log in.
@@ -1374,12 +1545,14 @@ class LoginAction(Action):
         db = self.db
         stored = db.user.get(userid, 'password')
         if givenpw == stored:
-            if db.config.WEB_MIGRATE_PASSWORDS and stored.needs_migration():
+            if (db.config.WEB_MIGRATE_PASSWORDS and
+                stored.needs_migration(config=db.config)):
                 newpw = password.Password(givenpw, config=db.config)
                 db.user.set(userid, password=newpw)
                 db.commit()
             return 1
-        if not givenpw and not stored:
+        # allow blank password
+        if db.config.WEB_LOGIN_EMPTY_PASSWORDS and not givenpw and not stored:
             return 1
         return 0
 
@@ -1414,8 +1587,22 @@ class ExportCSVAction(Action):
 
         # full-text search
         if request.search_text:
-            matches = self.db.indexer.search(
-                re.findall(r'\b\w{2,25}\b', request.search_text), klass)
+            indexer = self.db.indexer
+            if self.db.indexer.query_language:
+                try:
+                    matches = indexer.search(
+                        [request.search_text], klass)
+                except Exception as e:
+                    error = " ".join(e.args)
+                    self.client.add_error_message(error)
+                    self.client.response_code = 400
+                    # trigger error reporting. NotFound isn't right but...
+                    raise exceptions.NotFound(error)
+            else:
+                matches = indexer.search(
+                    re.findall(r'\b\w{%s,%s}\b' % (indexer.minlength,
+                                                   indexer.maxlength),
+                               request.search_text), klass)
         else:
             matches = None
 
@@ -1475,7 +1662,7 @@ class ExportCSVAction(Action):
                     return ""
                 else:
                     if (arg.local(self.db.getUserTimezone()).pretty('%H:%M') ==
-                        '00:00'):
+                            '00:00'):
                         fmt = '%Y-%m-%d'
                     else:
                         fmt = '%Y-%m-%d %H:%M'
@@ -1526,13 +1713,9 @@ class ExportCSVAction(Action):
         # generate the CSV output
         self.client._socket_op(writer.writerow, columns)
         # and search
-        for itemid in klass.filter(matches, filterspec, sort, group):
+        filter = klass.filter_with_permissions
+        for itemid in filter(matches, filterspec, sort, group):
             row = []
-            # don't put out a row of [hidden] fields if the user has
-            # no access to the issue.
-            if not self.hasPermission(self.permissionType, itemid=itemid,
-                                      classname=request.classname):
-                continue
             for name in columns:
                 # check permission for this property on this item
                 # TODO: Permission filter doesn't work for the 'user' class
@@ -1544,6 +1727,11 @@ class ExportCSVAction(Action):
                     repr_function = represent[name]
                 row.append(repr_function(klass.get(itemid, name)))
             self.client._socket_op(writer.writerow, row)
+
+        # force close of connection since we can't send a
+        # Content-Length header.
+        self.client.request.close_connection = True
+
         return '\n'
 
 
@@ -1579,8 +1767,23 @@ class ExportCSVWithIdAction(Action):
 
         # full-text search
         if request.search_text:
-            matches = self.db.indexer.search(
-                re.findall(r'\b\w{2,25}\b', request.search_text), klass)
+            indexer = self.db.indexer
+            if indexer.query_language:
+                try:
+                    matches = indexer.search(
+                        [request.search_text], klass)
+                except Exception as e:
+                    error = " ".join(e.args)
+                    self.client.add_error_message(error)
+                    self.client.response_code = 400
+                    # trigger error reporting. NotFound isn't right but...
+                    raise exceptions.NotFound(error)
+            else:
+                matches = indexer.search(
+                    re.findall(r'\b\w{%s,%s}\b' % (indexer.minlength,
+                                                   indexer.maxlength),
+                               request.search_text),
+                    klass)
         else:
             matches = None
 
@@ -1607,15 +1810,9 @@ class ExportCSVWithIdAction(Action):
         self.client._socket_op(writer.writerow, columns)
 
         # and search
-        for itemid in klass.filter(matches, filterspec, sort, group):
+        filter = klass.filter_with_permissions
+        for itemid in filter(matches, filterspec, sort, group):
             row = []
-            # FIXME should this code raise an exception if an item
-            # is included that can't be accessed? Enabling this
-            # check will just skip the row for the inaccessible item.
-            # This makes it act more like the web interface.
-            # if not self.hasPermission(self.permissionType, itemid=itemid,
-            #                          classname=request.classname):
-            #    continue
             for name in columns:
                 # check permission to view this property on this item
                 if not self.hasPermission(self.permissionType, itemid=itemid,
@@ -1641,7 +1838,146 @@ class ExportCSVWithIdAction(Action):
                 row.append(str(value))
             self.client._socket_op(writer.writerow, row)
 
+        # force close of connection since we can't send a
+        # Content-Length header.
+        self.client.request.close_connection = True
+
         return '\n'
+
+class ReauthAction(Action):
+    '''Allow an auditor to require change verification with user's password.
+
+       When changing sensitive information (e.g. passwords) it is
+       useful to ask for a validated authorization. This makes sure
+       that the user is present by typing their password.
+
+       In an auditor adding::
+
+          if 'password' in newvalues and not getattr(db, 'reauth_done', False):
+             raise Reauth()
+
+       will present the user with a authorization page when the
+       password is changed.  The page is generated from the
+       _generic.reauth.html template by default.
+
+       Once the user enters their password and submits the page, the
+       password will be verified using:
+       roundup.cgi.actions:LoginAction::verifyPassword().  If the
+       password is correct the original change is done.
+
+       To prevent the auditor from trigering another Reauth, the
+       attribute "reauth_done" is added to the db object. As a result,
+       the getattr call will return True and not raise Reauth.
+
+       You get one reauth for the submitted change. Note you cannot
+       Reauth multiple properties separately. If you need to auth
+       multiple properties separately, you need to reject the change
+       and force the user to submit each sensitive property separately.
+       For example::
+
+          if 'password' in newvalues and 'realname' in newvalues:
+             raise Reject('Changing the username and the realname '
+                          'at the same time is not allowed. Please '
+                          'submit two changes.')
+
+          if 'password' in newvalues and not getattr(db, 'reauth_done', False):
+             raise Reauth()
+
+          if 'realname' in newvalues and not getattr(db, 'reauth_done', False):
+             raise Reauth()
+
+        Limitations: Handling file inputs requires JavaScript on the browser.
+
+        See also: client.py:Client:reauth() which can be changed
+        using interfaces.py in your tracker.
+    '''
+
+    def handle(self):
+        ''' Handle a form with a reauth request.
+        '''
+
+        if self.client.env['REQUEST_METHOD'] != 'POST':
+            raise Reject(self._('Invalid request'))
+
+        if '@reauth_password' not in self.form:
+            self.client.add_error_message(self._('Password incorrect.'))
+            return
+
+        # Verify password
+        login = self.client.get_action_class('login')(self.client)
+        if not self.verifyPassword():
+            self.client.add_error_message(self._("Password incorrect."))
+            self.client.template = "reauth"
+
+            # Strip fields that are added by the template. All
+            # the rest of the fields in self.form.list are added
+            # as hidden fields by the reauth template.
+            self.form.list = [ x for x in self.form.list
+                               if x.name not in (
+                                       '@action',
+                                       '@csrf',
+                                       '@reauth_password',
+                                       '@template',
+                                       'submit'
+                               )
+                              ]
+            return
+
+        # extract the info we need to preserve/reinject into
+        # the next action.
+        
+        if '@next_action' not in self.form: # required to look up next action
+            self.client.add_error_message(
+                self._('Missing action to be authorized.'))
+            return
+
+        action = self.form['@next_action'].value.lower()
+
+        next_template = None;  # optional
+        if '@next_template' in self.form:
+            next_template = self.form['@next_template'].value
+
+        # rewrite the form for redisplay
+        # remove all the reauth_form_fields leaving just the original
+        # form fields from the form that trigered the reauth.
+        # We extracted @next_* above to route to the original action
+        # and template.
+
+        reauth_form_fields = ('@reauth_password', '@template',
+                              '@next_template', '@action',
+                              '@next_action', '@csrf', 'submit')
+
+        self.form.list = [ x for x in self.form.list
+                              if x.name not in reauth_form_fields
+                          ]
+
+        try:
+            action_klass = self.client.get_action_class(action)
+
+            # set the template to go back to
+            # use "" not None as this value gets encoded and None is invalid
+            self.client.template = next_template if next_template else ""
+            # use this in detector (to skip reauth
+            self.client.db.reauth_done = True
+            
+            # should raise exception Redirect
+            action_klass(self.client).execute()
+
+        except (ValueError, Reject) as err:
+            escape = not isinstance(err, RejectRaw)
+            self.add_error_message(str(err), escape=escape)
+
+    def verifyPassword(self):
+        """Verify the reauth password/token
+
+           This can be overridden using interfaces.py.
+
+           The default implementation uses the
+           LoginAction::verifyPassword() method.
+        """
+        login = self.client.get_action_class('login')(self.client)
+        return login.verifyPassword(self.userid,
+                                    self.form['@reauth_password'].value)
 
 
 class Bridge(BaseAction):
@@ -1659,8 +1995,8 @@ class Bridge(BaseAction):
         # different Action interfaces, we have to look at the arguments to
         # figure out how to complete construction.
         if (len(args) == 1 and
-            hasattr(args[0], '__class__') and
-            args[0].__class__.__name__ == 'Client'):
+                hasattr(args[0], '__class__') and
+                args[0].__class__.__name__ == 'Client'):
             self.cgi = True
             self.execute = self.execute_cgi
             self.client = args[0]

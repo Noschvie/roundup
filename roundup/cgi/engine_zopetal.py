@@ -7,28 +7,31 @@ import errno
 import mimetypes
 import os
 import os.path
+import stat
 
-from roundup.cgi.templating import StringIO, context, translationService, TALLoaderBase
-from roundup.cgi.PageTemplates import PageTemplate, GlobalTranslationService
+from roundup.cgi.templating import StringIO, context, TALLoaderBase
+from roundup.cgi.PageTemplates import PageTemplate
 from roundup.cgi.PageTemplates.Expressions import getEngine
 from roundup.cgi.TAL import TALInterpreter
-
-GlobalTranslationService.setGlobalTranslationService(translationService)
 
 
 class Loader(TALLoaderBase):
     templates = {}
 
-    def __init__(self, dir):
-        self.dir = dir
+    def __init__(self, template_dir):
+        self.template_dir = template_dir
 
     def load(self, tplname):
         # find the source
-        src, filename = self._find(tplname)
+        try:
+            src, filename = self._find(tplname)
+        except TypeError as e:
+            raise ValueError("Unable to load template file basename: %s: %s" % (
+                tplname, e))
 
         # has it changed?
         try:
-            stime = os.stat(src)[os.path.stat.ST_MTIME]
+            stime = os.stat(src)[stat.ST_MTIME]
         except os.error as error:
             if error.errno != errno.ENOENT:
                 raise
@@ -42,7 +45,8 @@ class Loader(TALLoaderBase):
         pt = RoundupPageTemplate()
         # use pt_edit so we can pass the content_type guess too
         content_type = mimetypes.guess_type(filename)[0] or 'text/html'
-        pt.pt_edit(open(src).read(), content_type)
+        with open(src) as srcd:
+            pt.pt_edit(srcd.read(), content_type)
         pt.id = filename
         pt.mtime = stime
         # Add it to the cache.  We cannot do this until the template

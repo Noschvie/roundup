@@ -1,9 +1,12 @@
 
 from __future__ import print_function
-from roundup.anypy.strings import u2s, uchr
 
 import sys
+
+from roundup.anypy.strings import u2s, uchr
+
 _pyver = sys.version_info[0]
+
 
 class dehtml:
     def __init__(self, converter):
@@ -17,13 +20,13 @@ class dehtml:
                 from bs4 import BeautifulSoup
 
                 def html2text(html):
-                    soup = BeautifulSoup(html)
+                    soup = BeautifulSoup(html, "html.parser")
 
                     # kill all script and style elements
                     for script in soup(["script", "style"]):
                         script.extract()
 
-                    return u2s(soup.get_text('\n', strip=True))
+                    return u2s(soup.get_text("\n", strip=True))
 
                 self.html2text = html2text
             else:
@@ -32,12 +35,12 @@ class dehtml:
             # use the fallback below if beautiful soup is not installed.
             try:
                 # Python 3+.
-                from html.parser import HTMLParser
                 from html.entities import name2codepoint
+                from html.parser import HTMLParser
             except ImportError:
                 # Python 2.
-                from HTMLParser import HTMLParser
                 from htmlentitydefs import name2codepoint
+                from HTMLParser import HTMLParser
 
             class DumbHTMLParser(HTMLParser):
                 # class attribute
@@ -62,7 +65,7 @@ class dehtml:
 
                     self.text = self.text + data
 
-                def handle_starttag(self, tag, attrs):
+                def handle_starttag(self, tag, attrs):  # noqa: ARG002
                     if (tag == "p"):
                         self.text = self.text + "\n"
                     if (tag in ("style", "script")):
@@ -80,13 +83,11 @@ class dehtml:
                         self.text = self.text + c
                     except UnicodeEncodeError:
                         # print a space as a placeholder
-                        self.text = self.text + ' '
+                        self.text = self.text + " "
 
             def html2text(html):
-                if _pyver == 3:
-                    parser = DumbHTMLParser(convert_charrefs=True)
-                else:
-                    parser = DumbHTMLParser()
+                parser = DumbHTMLParser(
+                    convert_charrefs=True) if _pyver == 3 else DumbHTMLParser()
                 parser.feed(html)
                 parser.close()
                 return parser.text
@@ -94,8 +95,8 @@ class dehtml:
             self.html2text = html2text
 
 
-if "__main__" == __name__:
-    html = '''
+if __name__ == "__main__":
+    html = """
 <body>
 <script>
 this must not be in output
@@ -144,7 +145,7 @@ have to install the win32all package separately (get it from
 </script>
 </div>
 </body>
-'''
+"""
 
     html2text = dehtml("dehtml").html2text
     if html2text:

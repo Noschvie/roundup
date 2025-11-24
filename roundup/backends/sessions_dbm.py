@@ -6,16 +6,17 @@ class. It's now also used for One Time Key handling too.
 """
 __docformat__ = 'restructuredtext'
 
-import os, marshal, time
+import marshal, os, random, time
 
 from roundup.anypy.html import html_escape as escape
 
 from roundup import hyperdb
 from roundup.i18n import _
 from roundup.anypy.dbm_ import anydbm, whichdb
+from roundup.backends.sessions_common import SessionCommon
 
 
-class BasicDatabase:
+class BasicDatabase(SessionCommon):
     ''' Provide a nice encapsulation of an anydbm store.
 
         Keys are id strings, values are automatically marshalled data.
@@ -41,6 +42,11 @@ class BasicDatabase:
             os.remove(path)
         elif os.path.exists(path+'.db'):    # dbm appends .db
             os.remove(path+'.db')
+        elif os.path.exists(path+".dir"):  # dumb dbm
+            os.remove(path+".dir")
+            os.remove(path+".dat")
+
+        #self._db_type = None
 
     def cache_db_type(self, path):
         ''' determine which DB wrote the class file, and cache it as an
@@ -88,11 +94,26 @@ class BasicDatabase:
 
     def set(self, infoid, **newvalues):
         db = self.opendb('c')
+        timestamp = None
         try:
             if infoid in db:
                 values = marshal.loads(db[infoid])
+                try:
+                    timestamp = values['__timestamp']
+                except KeyError:
+                    pass  # stay at None
             else:
-                values = {'__timestamp': time.time()}
+                values = {}
+
+            if '__timestamp' in newvalues:
+                try:
+                    float(newvalues['__timestamp'])
+                except ValueError:
+                    # keep original timestamp if present
+                    newvalues['__timestamp'] = timestamp or time.time()
+            else:
+                newvalues['__timestamp'] = time.time()
+
             values.update(newvalues)
             db[infoid] = marshal.dumps(values)
         finally:
@@ -126,7 +147,9 @@ class BasicDatabase:
 
         # new database? let anydbm pick the best dbm
         if not db_type:
-            return anydbm.open(path, 'c')
+            db = anydbm.open(path, 'c')
+            #self.cache_db_type(path)
+            return db
 
         # open the database with the correct module
         dbm = __import__(db_type)
@@ -136,23 +159,35 @@ class BasicDatabase:
             try:
                 handle = dbm.open(path, mode)
                 break
-            except OSError:
+            except OSError as e:
                 # Primarily we want to catch and retry:
                 #   [Errno 11] Resource temporarily unavailable retry
                 # FIXME: make this more specific
+                if retries_left < 10:
+                    self.log_warning(
+                        'dbm.open failed on ...%s, retry %s left: %s, %s' %
+                        (path[-15:], 15-retries_left, retries_left, e))
                 if retries_left < 0:
                     # We have used up the retries. Reraise the exception
                     # that got us here.
                     raise
                 else:
-                    # delay retry a bit
-                    time.sleep(0.01)
+                    # stagger retry to try to get around thundering herd issue.
+                    time.sleep(random.randint(0, 25)*.005)
                     retries_left = retries_left - 1
                     continue  # the while loop
         return handle
 
     def commit(self):
         pass
+
+    def lifetime(self, key_lifetime=0):
+        """Return the proper timestamp for a key with key_lifetime specified
+           in seconds. Default lifetime is 0.
+        """
+        now = time.time()
+        week = 60*60*24*7
+        return now - week + key_lifetime
 
     def close(self):
         pass
@@ -168,15 +203,18 @@ class BasicDatabase:
         ''' Remove session records that haven't been used for a week. '''
         now = time.time()
         week = 60*60*24*7
+        a_week_ago = now - week
         for sessid in self.list():
             sess = self.get(sessid, '__timestamp', None)
             if sess is None:
                 self.updateTimestamp(sessid)
                 continue
-            interval = now - sess
-            if interval > week:
+            if a_week_ago > sess:
                 self.destroy(sessid)
 
+        run_time = time.time() - now
+        if run_time > 3:
+            self.log_warning("clean() took %.2fs", run_time)
 
 class Sessions(BasicDatabase):
     name = 'sessions'

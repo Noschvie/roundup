@@ -4,10 +4,30 @@
 # set/get_tat and marshaling as string, support for testonly
 # and status method.
 
-from datetime import timedelta, datetime
+from datetime import datetime, timedelta
+
+try:
+    # used by python 3.11 and newer use tz aware dates
+    from datetime import UTC
+    dt_min = datetime.min.replace(tzinfo=UTC)
+    # start of unix epoch
+    dt_epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    fromisoformat = datetime.fromisoformat
+except ImportError:
+    # python 2.7 and older than 3.11 - use naive dates
+    dt_min = datetime.min
+    dt_epoch = datetime(1970, 1, 1)
+    def fromisoformat(date):
+        # only for naive dates
+        return datetime.strptime(date, "%Y-%m-%dT%H:%M:%S.%f")
+
+from roundup.anypy.datetime_ import utcnow
 
 
 class RateLimit:  # pylint: disable=too-few-public-methods
+
+    __slots__ = ("count", "period")
+
     def __init__(self, count, period):
         self.count = count
         self.period = period
@@ -18,6 +38,9 @@ class RateLimit:  # pylint: disable=too-few-public-methods
 
 
 class Gcra:
+
+    __slots__ = ("memory",)
+
     def __init__(self):
         self.memory = {}
 
@@ -26,7 +49,7 @@ class Gcra:
         if key in self.memory:
             return self.memory[key]
         else:
-            return datetime.min
+            return dt_min
 
     def set_tat(self, key, tat):
         self.memory[key] = tat
@@ -38,19 +61,19 @@ class Gcra:
         if key in self.memory:
             return self.memory[key].isoformat()
         else:
-            return datetime.min.isoformat()
+            return dt_min.isoformat()
 
     def set_tat_as_string(self, key, tat):
         # Take value as string and unmarshall:
         #  YYYY-MM-DDTHH:MM:SS.mmmmmm
         # to datetime
-        self.memory[key] = datetime.strptime(tat, "%Y-%m-%dT%H:%M:%S.%f")
+        self.memory[key] = fromisoformat(tat)
 
     def update(self, key, limit, testonly=False):
         '''Determine if the item associated with the key should be
            rejected given the RateLimit limit.
         '''
-        now = datetime.utcnow()
+        now = utcnow()
         tat = max(self.get_tat(key), now)
         separation = (tat - now).total_seconds()
         max_interval = limit.period.total_seconds() - limit.inverse
@@ -88,7 +111,7 @@ class Gcra:
                                           )
 
         # status of current limit as of now
-        now = datetime.utcnow()
+        now = utcnow()
 
         current_count = int((limit.period - (tat - now)).total_seconds() /
                             limit.inverse)
@@ -98,7 +121,7 @@ class Gcra:
         seconds_to_tat = (tat - now).total_seconds()
         ret['X-RateLimit-Reset'] = str(max(seconds_to_tat, 0))
         ret['X-RateLimit-Reset-date'] = "%s" % tat
-        ret['Now'] = str((now - datetime(1970, 1, 1)).total_seconds())
+        ret['Now'] = str((now - dt_epoch).total_seconds())
         ret['Now-date'] = "%s" % now
 
         if self.update(key, limit, testonly=True):
@@ -107,7 +130,7 @@ class Gcra:
             # One item is dequeued every limit.inverse seconds.
             ret['Retry-After'] = str(int(limit.inverse))
             ret['Retry-After-Timestamp'] = "%s" % \
-                    (now + timedelta(seconds=limit.inverse))  # noqa: E127
+                    (now + timedelta(seconds=limit.inverse))
         else:
             # if we are not rejected, the user can post another
             # attempt immediately.

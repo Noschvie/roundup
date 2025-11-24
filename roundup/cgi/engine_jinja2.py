@@ -31,7 +31,6 @@ minimal set (to avoid Roundup state changes from template).
 
 from __future__ import print_function
 import jinja2
-import gettext
 import mimetypes
 import sys
 
@@ -42,9 +41,9 @@ from roundup.anypy.strings import s2u
 
 
 class Jinja2Loader(LoaderBase):
-    def __init__(self, dir):
+    def __init__(self, template_dir):
         self._env = jinja2.Environment(
-            loader=jinja2.FileSystemLoader(dir),
+            loader=jinja2.FileSystemLoader(template_dir),
             extensions=['jinja2.ext.i18n'],
             autoescape=True
         )

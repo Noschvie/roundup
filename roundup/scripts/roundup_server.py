@@ -20,23 +20,18 @@
 from __future__ import print_function
 __docformat__ = 'restructuredtext'
 
-
-# --- patch sys.path to make sure 'import roundup' finds correct version
-import sys
-import os.path as osp
-
+import base64   # decode icon
+import errno
+import getopt
+import io
 import logging
-
-thisdir = osp.dirname(osp.abspath(__file__))
-rootdir = osp.dirname(osp.dirname(thisdir))
-if (osp.exists(thisdir + '/__init__.py') and
-        osp.exists(rootdir + '/roundup/__init__.py')):
-    # the script is located inside roundup source code
-    sys.path.insert(0, rootdir)
-# --/
-
-
-import errno, getopt, io, os, socket, sys, traceback, time
+import os
+import re
+import socket
+import sys     # modify sys.path when running in source tree
+import time
+import traceback
+import zlib    # decompress icon
 
 try:
     # Python 3.
@@ -50,31 +45,40 @@ try:
     reload
 except NameError:
     # Python 3.
-    from imp import reload
+    from importlib import reload
 
 try:
     from OpenSSL import SSL
 except ImportError:
     SSL = None
 
-from roundup.anypy.html import html_escape
+# --- patch sys.path to make sure 'import roundup' finds correct version
+import os.path as osp
 
-# python version check
-from roundup import configuration, version_check
-from roundup import __version__ as roundup_version
+thisdir = osp.dirname(osp.abspath(__file__))
+rootdir = osp.dirname(osp.dirname(thisdir))
+if (osp.exists(thisdir + '/__init__.py') and
+        osp.exists(rootdir + '/roundup/__init__.py')):
+    # the script is located inside roundup source code
+    sys.path.insert(0, rootdir)
+# --/
 
+import roundup.instance                                        # noqa: E402
+
+# python version_check raises exception if imported for wrong python version
+from roundup import configuration, version_check           # noqa: F401,E402
+from roundup import __version__ as roundup_version         # noqa: E402
 # Roundup modules of use here
-from roundup.anypy import http_, urllib_
-from roundup.anypy.strings import s2b, StringIO
-from roundup.cgi import cgitb, client
-from roundup.cgi.PageTemplates.PageTemplate import PageTemplate
-import roundup.instance
-from roundup.i18n import _
+from roundup.anypy import http_, urllib_                   # noqa: E402
+from roundup.anypy.html import html_escape                 # noqa: E402
+from roundup.anypy.strings import s2b, StringIO            # noqa: E402
+from roundup.cgi import cgitb, client                      # noqa: E402
+from roundup.cgi.PageTemplates.PageTemplate import PageTemplate  # noqa: E402
+from roundup.i18n import _                                 # noqa: E402
 
 # "default" favicon.ico
 # generate by using "icotool" and tools/base64
-import zlib, base64
-favico = zlib.decompress(base64.decodestring(b'''
+favico = zlib.decompress(base64.b64decode(b'''
 eJztjr1PmlEUh59XgVoshdYPWorFIhaRFq0t9pNq37b60lYSTRzcTFw6GAfj5gDYaF0dTB0MxMSE
 gQQd3FzKJiEC0UCIUUN1M41pV2JCXySg/0ITn5tfzvmdc+85FwT56HSc81UJjXJsk1UsNcsSqCk1
 BS64lK+vr7OyssLJyQl2ux2j0cjU1BQajYZIJEIwGMRms+H3+zEYDExOTjI2Nsbm5iZWqxWv18vW
@@ -95,7 +99,7 @@ DEFAULT_PORT = 8080
 # "debug" means "none" + no tracker/template cache
 MULTIPROCESS_TYPES = ["debug", "none"]
 try:
-    import threading  # nosrc: F401
+    import threading  # noqa: F401
 except ImportError:
     pass
 else:
@@ -107,20 +111,20 @@ DEFAULT_MULTIPROCESS = MULTIPROCESS_TYPES[-1]
 
 def auto_ssl():
     print(_('WARNING: generating temporary SSL certificate'))
-    import OpenSSL, random
+    import OpenSSL, random                               # noqa: E401
     pkey = OpenSSL.crypto.PKey()
-    pkey.generate_key(OpenSSL.crypto.TYPE_RSA, 768)
+    pkey.generate_key(OpenSSL.crypto.TYPE_RSA, 2048)
     cert = OpenSSL.crypto.X509()
     cert.set_serial_number(random.randint(0, sys.maxsize))
     cert.gmtime_adj_notBefore(0)
     cert.gmtime_adj_notAfter(60 * 60 * 24 * 365)  # one year
     cert.get_subject().CN = '*'
-    cert.get_subject().O = 'Roundup Dummy Certificate'
+    cert.get_subject().O = 'Roundup Dummy Certificate'            # noqa: E741
     cert.get_issuer().CN = 'Roundup Dummy Certificate Authority'
-    cert.get_issuer().O = 'Self-Signed'
+    cert.get_issuer().O = 'Self-Signed'                           # noqa: E741
     cert.set_pubkey(pkey)
-    cert.sign(pkey, 'md5')
-    ctx = SSL.Context(SSL.SSLv23_METHOD)
+    cert.sign(pkey, 'sha512')
+    ctx = SSL.Context(OpenSSL.SSL.TLSv1_2_METHOD)
     ctx.use_privatekey(pkey)
     ctx.use_certificate(cert)
 
@@ -133,9 +137,19 @@ class SecureHTTPServer(http_.server.HTTPServer):
         http_.server.HTTPServer.__init__(self, server_address, HandlerClass)
         self.socket = socket.socket(self.address_family, self.socket_type)
         if ssl_pem:
-            ctx = SSL.Context(SSL.SSLv23_METHOD)
-            ctx.use_privatekey_file(ssl_pem)
-            ctx.use_certificate_file(ssl_pem)
+            ctx = SSL.Context(SSL.TLSv1_2_METHOD)
+            try:
+                ctx.use_privatekey_file(ssl_pem)
+            except SSL.Error:
+                print(_("Unable to find/use key from file: %(pemfile)s") % {"pemfile": ssl_pem})
+                print(_("Does it have a private key surrounded by '-----BEGIN PRIVATE KEY-----' and\n  '-----END PRIVATE KEY-----' markers?"))
+                exit()
+            try:
+                ctx.use_certificate_file(ssl_pem)
+            except SSL.Error:
+                print(_("Unable to find/use certificate from file: %(pemfile)s") % {"pemfile": ssl_pem})
+                print(_("Does it have a certificate surrounded by '-----BEGIN CERTIFICATE-----' and\n  '-----END CERTIFICATE-----' markers?"))
+                exit()
         else:
             ctx = auto_ssl()
         self.ssl_context = ctx
@@ -161,6 +175,13 @@ class SecureHTTPServer(http_.server.HTTPServer):
                             return self.__fileobj.readline(*args)
                         except SSL.WantReadError:
                             time.sleep(.1)
+                        except SSL.ZeroReturnError:
+                            # Raised here on every request.
+                            # SSL connection has been closed.
+                            # But maybe not the underlying socket.
+                            # FIXME: Does this lead to a socket leak??
+                            #  if so how to fix?
+                            pass
 
                 def read(self, *args):
                     """ SSL.Connection can return WantRead """
@@ -169,6 +190,15 @@ class SecureHTTPServer(http_.server.HTTPServer):
                             return self.__fileobj.read(*args)
                         except SSL.WantReadError:
                             time.sleep(.1)
+                        except SSL.ZeroReturnError:
+                            # Put here to match readline() handling above.
+                            # Even though this never was the source of the
+                            #  exception logged during use.
+                            # SSL connection has been closed.
+                            # But maybe not the underlying socket.
+                            # FIXME: Does this lead to a socket leak??
+                            #  if so how to fix?
+                            pass
 
                 def __getattr__(self, attrib):
                     return getattr(self.__fileobj, attrib)
@@ -180,8 +210,26 @@ class SecureHTTPServer(http_.server.HTTPServer):
                     self.__conn = conn
 
                 def makefile(self, mode, bufsize):
-                    fo = socket._fileobject(self.__conn, mode, bufsize)
-                    return RetryingFile(fo)
+                    fo = None
+                    try:
+                        # see below of url used for this
+                        fo = socket.SocketIO(self.__conn, mode)
+                    except AttributeError:
+                        # python 2 in use
+                        buffer = socket._fileobject(self.__conn, mode, bufsize)
+
+                    if fo:
+                        # python3 set up buffering
+                        # verify mode is rb and bufsize is -1
+                        # implement subset of socket::makefile
+                        # https://bugs.launchpad.net/python-glanceclient/+bug/1812525
+                        if mode == 'rb' and bufsize == -1:
+                            buffering = io.DEFAULT_BUFFER_SIZE
+                            buffer = io.BufferedReader(fo, buffering)
+                        else:
+                            buffer = fo
+
+                    return RetryingFile(buffer)
 
                 def __getattr__(self, attrib):
                     return getattr(self.__conn, attrib)
@@ -230,39 +278,50 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
             self.send_error(404, self.path)
         except client.Unauthorised as message:
             self.send_error(403, '%s (%s)' % (self.path, message))
-        except:
+        except Exception:
             exc, val, tb = sys.exc_info()
             if hasattr(socket, 'timeout') and isinstance(val, socket.timeout):
                 self.log_error('timeout')
+                self.send_response(408)
+                self.send_header('Content-Type', 'text/html')
+
+                output = s2b('''<body><p>Connection timed out</p></body>''')
+                # Close connection
+                self.send_header('Content-Length', len(output))
+                self.end_headers()
+                self.wfile.write(output)
+                self.close_connection = True
             else:
-                # it'd be nice to be able to detect if these are going to have
-                # any effect...
                 self.send_response(400)
                 self.send_header('Content-Type', 'text/html')
-                self.end_headers()
                 if self.DEBUG_MODE:
                     try:
                         reload(cgitb)
-                        self.wfile.write(s2b(cgitb.breaker()))
-                        self.wfile.write(s2b(cgitb.html()))
-                    except:
+                        output = s2b(cgitb.breaker()) + s2b(cgitb.html())
+                    except Exception:
                         s = StringIO()
                         traceback.print_exc(None, s)
-                        self.wfile.write(b"<pre>")
-                        self.wfile.write(s2b(html_escape(s.getvalue())))
-                        self.wfile.write(b"</pre>\n")
+                        output = b"<pre>%s</pre>" % s2b(
+                            html_escape(s.getvalue()))
                 else:
                     # user feedback
-                    self.wfile.write(s2b(cgitb.breaker()))
                     ts = time.ctime()
-                    self.wfile.write(s2b('''<p>%s: An error occurred. Please check
-                    the server log for more information.</p>''' % ts))
+                    output = (
+                        s2b('''<body><p>%s: An error occurred. Please check
+                        the server log for more information.</p></body>''' %
+                            ts)
+                    )
                     # out to the logfile
                     print('EXCEPTION AT', ts)
                     traceback.print_exc()
 
+                # complete output to user.
+                self.send_header('Content-Length', len(output))
+                self.end_headers()
+                self.wfile.write(output)
+
     do_GET = do_POST = do_HEAD = do_PUT = do_DELETE = \
-                       do_PATCH = do_OPTIONS = run_cgi
+        do_PATCH = do_OPTIONS = run_cgi
 
     def index(self):
         ''' Print up an index of the available trackers
@@ -271,12 +330,14 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
         if len(keys) == 1:
             self.send_response(302)
             self.send_header('Location', urllib_.quote(keys[0]) + '/index')
+            self.send_header('Content-Length', 0)
             self.end_headers()
-        else:
-            self.send_response(200)
+            return
 
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        output = []
+
         w = self.wfile.write
 
         if self.CONFIG and self.CONFIG['TEMPLATE']:
@@ -286,18 +347,23 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
             extra = {'trackers': self.TRACKERS,
                      'nothing': None,
                      'true': 1,
-                     'false': 0,
-                    }
-            w(s2b(pt.pt_render(extra_context=extra)))
+                     'false': 0}
+            output.append(s2b(pt.pt_render(extra_context=extra)))
         else:
-            w(s2b(_('<html><head><title>Roundup trackers index</title></head>\n'
-                    '<body><h1>Roundup trackers index</h1><ol>\n')))
+            output.append(s2b(_(
+                '<html><head><title>Roundup trackers index</title></head>\n'
+                '<body><h1>Roundup trackers index</h1><ol>\n')))
             keys.sort()
             for tracker in keys:
-                w(s2b('<li><a href="%(tracker_url)s/index">%(tracker_name)s</a>\n' % {
+                output.append(s2b('<li><a href="%(tracker_url)s/index">%(tracker_name)s</a>\n' % {
                     'tracker_url': urllib_.quote(tracker),
                     'tracker_name': html_escape(tracker)}))
-            w(b'</ol></body></html>')
+            output.append(b'</ol></body></html>\n')
+
+        write_output = b"\n".join(output)
+        self.send_header('Content-Length', len(write_output))
+        self.end_headers()
+        w(write_output)
 
     def inner_run_cgi(self):
         ''' This is the inner part of the CGI handling
@@ -321,6 +387,8 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
 
             self.send_response(200)
             self.send_header('Content-Type', 'image/x-icon')
+            self.send_header('Content-Length', len(favico))
+            self.send_header('Cache-Control', "public, max-age=86400")
             self.end_headers()
 
             # this bufsize is completely arbitrary, I picked 4K because
@@ -339,7 +407,7 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
 
             return
 
-        i = self.path.rfind('?')
+        i = self.path.find('?')
         if i >= 0:
             # rest starts with /, query is without ?
             rest, query = self.path[:i], self.path[i+1:]
@@ -364,7 +432,12 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
             url = '%s://%s%s/' % (protocol, self.headers['host'], rest)
             if query:
                 url += '?' + query
+
+            # Do not allow literal \n or \r in URL to prevent
+            # HTTP Response Splitting
+            url = re.sub("[\r\n]", "", url)
             self.send_header('Location', url)
+            self.send_header('Content-Length', 17)
             self.end_headers()
             self.wfile.write(b'Moved Permanently')
             return
@@ -406,6 +479,12 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
         if co:
             env['HTTP_COOKIE'] = ', '.join(co)
         env['HTTP_AUTHORIZATION'] = self.headers.get('authorization')
+        # self.CONFIG['INCLUDE_HEADERS'] is a list.
+        for h in self.CONFIG['INCLUDE_HEADERS']:
+            env[h] = self.headers.get(h, None)
+            # if header is MISSING
+            if env[h] is None:
+                del (env[h])
         env['SCRIPT_NAME'] = ''
         env['SERVER_NAME'] = self.server.server_name
         env['SERVER_PORT'] = str(self.server.server_port)
@@ -429,7 +508,7 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
             # config option to control its use.
             # Made available for extensions if the user trusts it.
             # E.g. you may wish to disable recaptcha validation extension
-            # if the ip of the client matches 172.16.0.0.
+            # if the ip of the client matches 198.51.100.X
             env['HTTP_X_FORWARDED_FOR'] = xff
         xfp = self.headers.get('X-Forwarded-Proto', None)
         if xfp:
@@ -460,17 +539,38 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
         range = self.headers.get('range')
         if range:
             env['HTTP_RANGE'] = range
+        if_range = self.headers.get('if-range')
+        if range:
+            env['HTTP_IF_RANGE'] = if_range
 
         # do the roundup thing
         tracker = self.get_tracker(tracker_name)
         tracker.Client(tracker, self, env).main()
 
     def address_string(self):
+        """Get IP address of client from:
+               left most element of X-Forwarded-For header element if set
+               client ip address otherwise.
+           if returned string is from X-Forwarded-For append + to string.
+        """
+        from_forwarded_header=""
+        forwarded_for = None
+
+        # if connection timed out, there is no headers property
+        if hasattr(self, 'headers') and ('X-FORWARDED-FOR' in self.headers):
+            forwarded_for = re.split(r'[,\s]',
+                                     self.headers['X-FORWARDED-FOR'],
+                                     maxsplit=1)[0]
+            from_forwarded_header="+"
         if self.LOG_IPADDRESS:
-            return self.client_address[0]
+            return "%s%s" % (forwarded_for or self.client_address[0],
+                             from_forwarded_header)
         else:
-            host, port = self.client_address
-            return socket.getfqdn(host)
+            if forwarded_for:
+                host = forwarded_for
+            else:
+                host, port = self.client_address
+            return "%s%s" % (socket.getfqdn(host), from_forwarded_header)
 
     def log_message(self, format, *args):
         ''' Try to *safely* log to stderr.
@@ -479,13 +579,13 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
             logger = logging.getLogger('roundup.http')
 
             logger.info("%s - - [%s] %s" %
-                        (self.client_address[0],
+                        (self.address_string(),
                          self.log_date_time_string(),
                          format % args))
         else:
             try:
                 http_.server.BaseHTTPRequestHandler.log_message(self,
-                                                         format, *args)
+                                                                format, *args)
             except IOError:
                 # stderr is no longer viable
                 pass
@@ -499,8 +599,8 @@ class RoundupRequestHandler(http_.server.BaseHTTPRequestHandler):
 
 def error():
     exc_type, exc_value = sys.exc_info()[:2]
-    return _('Error: %(type)s: %(value)s' % {'type': exc_type,
-                                             'value': exc_value})
+    return _('Error: %(type)s: %(value)s') % {'type': exc_type,
+                                             'value': exc_value}
 
 
 def setgid(group):
@@ -573,7 +673,7 @@ class TrackerHomeOption(configuration.FilePathOption):
 class ServerConfig(configuration.Config):
 
     SETTINGS = (
-            ("main", (
+        ("main", (
             (configuration.Option, "host", "localhost",
                 "Host name of the Roundup web server instance.\n"
                 "If left unconfigured (no 'host' setting) the default\n"
@@ -599,6 +699,9 @@ class ServerConfig(configuration.Config):
                 "In order to use this option, "
                 "the server must be run initially as root.\n"
                 "Availability: Unix."),
+            (configuration.IntegerNumberOption, "max_children", 40,
+                "Maximum number of children to spawn using fork "
+                "multiprocess mode."),
             (configuration.BooleanOption, "nodaemon", "no",
                 "don't fork (this overrides the pidfile mechanism)'"),
             (configuration.BooleanOption, "log_hostnames", "no",
@@ -609,6 +712,11 @@ class ServerConfig(configuration.Config):
                 "If set to yes the python logging module is used with "
                 "qualname\n'roundup.http'. Otherwise logging is done to "
                 "stderr or the file\nspecified using the -l/logfile option."),
+            (configuration.BooleanOption, "log_proxy_header", "no",
+                "Use first element of reverse proxy header X-Forwarded-For\n"
+                "as client IP address. This appends a '+' sign to the logged\n"
+                "host ip/name. Use only if server is accessible only via\n"
+                "trusted reverse proxy."),
             (configuration.NullableFilePathOption, "pidfile", "",
                 "File to which the server records "
                 "the process id of the daemon.\n"
@@ -624,8 +732,22 @@ class ServerConfig(configuration.Config):
             (configuration.BooleanOption, "ssl", "no",
                 "Enable SSL support (requires pyopenssl)"),
             (configuration.NullableFilePathOption, "pem", "",
-                "PEM file used for SSL. A temporary self-signed certificate\n"
-                "will be used if left blank."),
+                "PEM file used for SSL. The PEM file must include\n"
+                "both the private key and certificate with appropriate\n"
+                'headers (i.e. "-----BEGIN PRIVATE KEY-----",\n'
+                '"-----END PRIVATE KEY-----" and '
+                '"-----BEGIN CERTIFICATE-----",\n'
+                '"-----END CERTIFICATE-----". A temporary self-signed\n'
+                "certificate will be used if left blank."),
+            (configuration.WordListOption, "include_headers", "",
+                "Comma separated list of extra headers that should\n"
+                "be copied into the CGI environment.\n"
+                "E.G. if you want to access the REMOTE_USER and\n"
+                "X-Proxy-User headers in the back end,\n"
+                "set to the value REMOTE_USER,X-Proxy-User."),
+            (configuration.HttpVersionOption, "http_version", "HTTP/1.1",
+                "Change to HTTP/1.0 if needed. This disables keepalive."),
+
         )),
         ("trackers", (), "Roundup trackers to serve.\n"
             "Each option in this section defines single Roundup tracker.\n"
@@ -645,11 +767,15 @@ class ServerConfig(configuration.Config):
         "pidfile": "d:",
         "nodaemon": "D",
         "log_hostnames": "N",
+        "max_children": "m:",
         "multiprocess": "t:",
         "template": "i:",
         "loghttpvialogger": 'L',
+        "log_proxy_header": 'P',
         "ssl": "s",
         "pem": "e:",
+        "include_headers": "I:",
+        "http_version": 'V:',
     }
 
     def __init__(self, config_file=None):
@@ -672,8 +798,9 @@ class ServerConfig(configuration.Config):
     def getopt(self, args, short_options="", long_options=(),
                config_load_options=("C", "config"), **options):
         options.update(self.OPTIONS)
-        return configuration.Config.getopt(self, args,
-            short_options, long_options, config_load_options, **options)
+        return configuration.Config.getopt(
+            self, args, short_options, long_options,
+            config_load_options, **options)
 
     def _get_name(self):
         return "Roundup server"
@@ -719,6 +846,8 @@ class ServerConfig(configuration.Config):
                     # internal state correctly so that later closing SSL
                     # socket works (with SSL end-handshake started)
                     self.request.do_handshake()
+                RoundupRequestHandler.protocol_version = \
+                    self.CONFIG["HTTP_VERSION"]
                 RoundupRequestHandler.setup(self)
 
             def finish(self):
@@ -748,6 +877,7 @@ class ServerConfig(configuration.Config):
                                 base_server):
                 pass
             server_class = ForkingServer
+            server_class.max_children = self["MAX_CHILDREN"]
         elif self["MULTIPROCESS"] == "thread":
             class ThreadingServer(socketserver.ThreadingMixIn,
                                   base_server):
@@ -768,6 +898,16 @@ class ServerConfig(configuration.Config):
             if e.args[0] == errno.EADDRINUSE:
                 raise socket.error(_("Unable to bind to port %s, "
                                      "port already in use.") % self["PORT"])
+            if e.args[0] == errno.EACCES:
+                raise socket.error(_(
+                    "Unable to bind to port %(port)s, "
+                    "access not allowed, "
+                    "errno: %(errno)s %(msg)s") % {
+                        "port": self["PORT"],
+                        "errno": e.args[0],
+                        "msg": e.args[1]}
+                )
+
             raise
         # change user and/or group
         setgid(self["GROUP"])
@@ -802,8 +942,9 @@ else:
             config = ServerConfig()
             (optlist, args) = config.getopt(sys.argv[1:])
             if not config["LOGFILE"]:
-                servicemanager.LogMsg(servicemanager.EVENTLOG_ERROR_TYPE,
-                                      servicemanager.PYS_SERVICE_STOPPED,
+                servicemanager.LogMsg(
+                    servicemanager.EVENTLOG_ERROR_TYPE,
+                    servicemanager.PYS_SERVICE_STOPPED,
                     (self._svc_display_name_, "\r\nMissing logfile option"))
                 self.ReportServiceStatus(win32service.SERVICE_STOPPED)
                 return
@@ -849,10 +990,11 @@ def usage(message=''):
  -g <GID>      runs the Roundup web server as this GID
  -d <PIDfile>  run the server in the background and write the server's PID
                to the file indicated by PIDfile. The -l option *must* be
-               specified if -d is used.'''
+               specified if -d is used.
+ -D            run the server in the foreground even when -d is used.'''
     if message:
-        message += '\n'
-    print(_('''%(message)sUsage: roundup-server [options] [name=tracker home]*
+        message += '\n\n'
+    print(_('''\n%(message)sUsage: roundup-server [options] [name=tracker home]*
 
 Options:
  -v            print the Roundup version number and exit
@@ -864,14 +1006,22 @@ Options:
                connections, defaults to localhost, use 0.0.0.0 to bind
                to all network interfaces
  -p <port>     set the port to listen on (default: %(port)s)
+ -I <header1[,header2]*> list of headers to pass to the backend
  -l <fname>    log to the file indicated by fname instead of stderr/stdout
  -N            log client machine names instead of IP addresses (much slower)
  -i <fname>    set tracker index template
+ -m <children> maximum number of children to spawn in fork multiprocess mode
  -s            enable SSL
  -L            http request logging uses python logging (roundup.http)
+ -P            log client address/name using reverse proxy X-Forwarded-For
+               header and not the connection IP (which is the reverse proxy).
+               Appends a '+' sign to the logged address/name.
  -e <fname>    PEM file containing SSL key and certificate
  -t <mode>     multiprocess mode (default: %(mp_def)s).
                Allowed values: %(mp_types)s.
+ -V <version>  set HTTP version (default: HTTP/1.1).
+               Allowed values: HTTP/1.0, HTTP/1.1.
+
 %(os_part)s
 
 Long options:
@@ -1052,6 +1202,9 @@ ERROR: -c is not available because roundup couldn't import
         config.set_logging()
     if config["PIDFILE"]:
         config["PIDFILE"] = os.path.abspath(config["PIDFILE"])
+        if not (config["LOGFILE"] or config["LOGHTTPVIALOGGER"]):
+            print(_("If you specify a PID file you must use -l or -L."))
+            sys.exit(1)
 
     # fork the server from our parent if a pidfile is specified
     if config["PIDFILE"]:
@@ -1083,6 +1236,13 @@ ERROR: -c is not available because roundup couldn't import
         httpd.serve_forever()
     except KeyboardInterrupt:
         print('Keyboard Interrupt: exiting')
+        try:
+            httpd.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            # forced shutdown can throw an error.
+            # we don't care as we are going away.
+            pass
+        httpd.socket.close()
 
 
 if __name__ == '__main__':

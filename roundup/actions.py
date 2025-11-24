@@ -5,8 +5,8 @@
 # Actions used in REST and XMLRPC APIs
 #
 
-from roundup.exceptions import Unauthorised
 from roundup import hyperdb
+from roundup.exceptions import Unauthorised
 
 
 class Action:
@@ -59,7 +59,8 @@ class Retire(PermCheck):
 
         # make sure we don't try to retire admin or anonymous
         if (classname == 'user' and
-               self.db.user.get(itemid, 'username') in ('admin', 'anonymous')):
+            self.db.user.get(itemid, 'username') in ('admin', 'anonymous')):
+
             raise ValueError(self._(
                 'You may not retire the admin or anonymous user'))
 

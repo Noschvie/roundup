@@ -40,10 +40,10 @@ except ImportError:
 
 import os
 import sys
-import warnings
 
 from roundup import configuration, mailgw
 from roundup import hyperdb, backends, actions
+from roundup.anypy import scandir_
 from roundup.cgi import client, templating
 from roundup.cgi import actions as cgi_actions
 from roundup.exceptions import RoundupException
@@ -62,10 +62,6 @@ class Tracker:
         """
         self.tracker_home = tracker_home
         self.optimize = optimize
-        # if set, call schema_hook after executing schema.py will get
-        # same variables (in particular db) as schema.py main purpose is
-        # for regression tests
-        self.schema_hook = None
         self.config = configuration.CoreConfig(tracker_home)
         self.actions = {}
         self.cgi_actions = {}
@@ -79,27 +75,6 @@ class Tracker:
                                                self.config["TEMPLATE_ENGINE"])
 
         rdbms_backend = self.config.RDBMS_BACKEND
-
-        # TODO: Remove in v1.7
-        # Provide some backwards compatability for existing Roundup instances
-        # that still define the backend type in 'db/backend_name' and warn the
-        # users they need to update their config.ini
-        if rdbms_backend == '':
-            filename = os.path.join(self.config.DATABASE, 'backend_name')
-            msg = """\n
-The 'backend_name' file is no longer used to configure the database backend
-used for the tracker.  Please read 'doc/upgrading.txt' to find out how to
-update your config.ini
-"""
-            try:
-                with open(filename) as backend_file:
-                    rdbms_backend = backend_file.readline().strip()
-
-                with warnings.catch_warnings():
-                    warnings.simplefilter("once", DeprecationWarning)
-                    warnings.warn(msg, DeprecationWarning, stacklevel=2)
-            except IOError:
-                pass
 
         self.backend = backends.get_backend(rdbms_backend)
 
@@ -140,21 +115,21 @@ update your config.ini
         if self.optimize:
             # execute preloaded schema object
             self._exec(self.schema, env)
-            if isinstance(self.schema_hook, Callable):
-                self.schema_hook(**env)
             # use preloaded detectors
             detectors = self.detectors
         else:
             # execute the schema file
             self._execfile('schema.py', env)
-            if isinstance(self.schema_hook, Callable):
-                self.schema_hook(**env)
             # reload extensions and detectors
             for extension in self.get_extensions('extensions'):
                 extension(self)
             detectors = self.get_extensions('detectors')
         db = env['db']
         db.tx_Source = None
+        # Useful for script when multiple open calls happen. Scripts have
+        # to inject the i18n object, there is currently no support for this
+        if hasattr(self, 'i18n'):
+            db.i18n = self.i18n
 
         # apply the detectors
         for detector in detectors:
@@ -184,8 +159,9 @@ update your config.ini
                                          "non-existent class %s"
                                          % (classname, propname, linkto))
 
-            db.post_init()
             self.db_open = 1
+        # *Must* call post_init! It is not an error if called multiple times.
+        db.post_init()
         return db
 
     def load_interfaces(self):
@@ -213,7 +189,8 @@ update your config.ini
         dirpath = os.path.join(self.tracker_home, dirname)
         if os.path.isdir(dirpath):
             sys.path.insert(1, dirpath)
-            for name in os.listdir(dirpath):
+            for dir_entry in os.scandir(dirpath):
+                name = dir_entry.name
                 if not name.endswith('.py'):
                     continue
                 env = {}
@@ -239,7 +216,8 @@ update your config.ini
 
     def _compile(self, fname):
         fname = os.path.join(self.tracker_home, fname)
-        return compile(builtins.open(fname).read(), fname, 'exec')
+        with builtins.open(fname) as fnamed:
+            return compile(fnamed.read(), fname, 'exec')
 
     def _exec(self, obj, env):
         if self.libdir:
@@ -269,78 +247,48 @@ update your config.ini
             self.cgi_actions[name] = action
 
     def registerUtil(self, name, function):
+        """Register a function that can be called using:
+           `utils.<name>(...)`.
+
+           The function is defined as:
+
+               def function(...):
+
+           If you need access to the client, database, form or other
+           item, you have to pass it explicitly::
+
+               utils.name(request.client, ...)
+
+           If you need client access, consider using registerUtilMethod()
+           instead.
+
+        """
         self.templating_utils[name] = function
 
+    def registerUtilMethod(self, name, function):
+        """Register a method that can be called using:
+           `utils.<name>(...)`.
+
+           Unlike registerUtil, the method is defined as:
+
+               def function(self, ...):
+
+           `self` is a TemplatingUtils object. You can use self.client
+           to access the client object for your request.
+        """
+        setattr(self.TemplatingUtils,
+                name, 
+                function)
 
 class TrackerError(RoundupException):
     pass
 
 
-class OldStyleTrackers:
-    def __init__(self):
-        self.number = 0
-        self.trackers = {}
-
-    def open(self, tracker_home, optimize=0):
-        """Open the tracker.
-
-        Parameters:
-            tracker_home:
-                tracker home directory
-            optimize:
-                if set, precompile html templates
-
-        Raise ValueError if the tracker home doesn't exist.
-
-        """
-        import imp
-        # sanity check existence of tracker home
-        if not os.path.exists(tracker_home):
-            raise ValueError('no such directory: "%s"' % tracker_home)
-
-        # sanity check tracker home contents
-        for reqd in 'config dbinit select_db interfaces'.split():
-            if not os.path.exists(os.path.join(tracker_home, '%s.py' % reqd)):
-                raise TrackerError('File "%s.py" missing from tracker '
-                                   'home "%s"' % (reqd, tracker_home))
-
-        if tracker_home in self.trackers:
-            return imp.load_package(self.trackers[tracker_home],
-                                    tracker_home)
-        # register all available backend modules
-        backends.list_backends()
-        self.number = self.number + 1
-        modname = '_roundup_tracker_%s' % self.number
-        self.trackers[tracker_home] = modname
-
-        # load the tracker
-        tracker = imp.load_package(modname, tracker_home)
-
-        # ensure the tracker has all the required bits
-        for required in 'open init Client MailGW'.split():
-            if not hasattr(tracker, required):
-                raise TrackerError('Required tracker attribute "%s" missing' %
-                                   required)
-
-        # load and apply the config
-        tracker.config = configuration.CoreConfig(tracker_home)
-        tracker.dbinit.config = tracker.config
-
-        tracker.optimize = optimize
-        tracker.templates = templating.get_loader(tracker.config["TEMPLATES"])
-        if optimize:
-            tracker.templates.precompile()
-
-        return tracker
-
-
-OldStyleTrackers = OldStyleTrackers()
-
-
 def open(tracker_home, optimize=0):
     if os.path.exists(os.path.join(tracker_home, 'dbinit.py')):
         # user should upgrade...
-        return OldStyleTrackers.open(tracker_home, optimize=optimize)
+        raise TrackerError("Old style trackers using dbinit.py "
+                           "are not supported after release 2.0")
 
     return Tracker(tracker_home, optimize=optimize)
 

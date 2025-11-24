@@ -8,6 +8,7 @@ Public domain work by:
 """
 
 from __future__ import print_function
+
 from subprocess import check_output
 
 # --- output settings
@@ -28,11 +29,11 @@ ALIASES = {
       ['Ralf Schlatterbeck <schlatterbeck@users.sourceforge.net>'],
   'Stefan Seefeld <stefan@seefeld.name>':
       ['Stefan Seefeld <stefan@users.sourceforge.net>'],
-  'John P. Rouillard <rouilj@cs.umb.edu>':
-      ['rouilj'],
+  'John Rouillard <rouilj@ieee.org>':
+      ['rouilj@uland', 'rouilj'],
 }
 ROBOTS = ['No Author <no-author@users.sourceforge.net>']
-# /-- 
+# /--
 
 
 def compress(years):
@@ -78,9 +79,18 @@ def compress(years):
 
 
 if __name__ == '__main__':
+
+  command = 'hg log --template "{date(date,\\"%Y\\")},{author}\\n"'
+
   if verbose:
     print("Getting HG log...")
-  authorship = check_output('hg log --template "{date(date,\\"%Y\\")},{author}\n"')
+    print("Using: ", command)
+
+  authorship = check_output(command, shell=True)
+
+  if not isinstance(authorship, str):
+    authorship = authorship.decode('utf-8')
+
   # authorship are strings like
   # 2003,Richard Jones <richard@users.sourceforge.net>
   # ...
@@ -105,11 +115,11 @@ if __name__ == '__main__':
     author = author.replace('<', '(')
     author = author.replace('>', ')')
     # years
-    if not year in years:
+    if year not in years:
       years[year] = set()
     years[year].add(author)
     # names
-    if not author in names:
+    if author not in names:
       names[author] = set()
     names[author].add(int(year))
 
@@ -128,14 +138,14 @@ if __name__ == '__main__':
     if verbose:
       print("Years for each contributor...")
     print('')
-    
+
     def last_year(name):
       """Return year of the latest contribution for a given name"""
-      return sorted(list(names[name]))[-1]
+      return sorted(names[name])[-1]
 
     def first_year(name):
       """Return year of the first contribution"""
-      return sorted(list(names[name]))[0]
+      return sorted(names[name])[0]
 
     def year_key(name):
       """
@@ -144,9 +154,9 @@ if __name__ == '__main__':
       the most recent and long-term contributors are at the top.
       """
       return (last_year(name), -first_year(name))
-    
+
     print("Copyright (c)")
-    for author in sorted(list(names), key=year_key, reverse=True):
+    for author in sorted(names, key=year_key, reverse=True):
       years = list(names[author])
       yearstr = compress(years)
 

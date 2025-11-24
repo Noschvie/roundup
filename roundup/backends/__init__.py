@@ -19,8 +19,6 @@
 '''
 __docformat__ = 'restructuredtext'
 
-import sys
-
 # These names are used to suppress import errors.
 # If get_backend raises an ImportError with appropriate
 # module name, have_backend quietly returns False.
@@ -28,20 +26,22 @@ import sys
 _modules = {
     'mysql': ('MySQLdb',),
     'postgresql': ('psycopg2',),
-    'sqlite': ('pysqlite', 'pysqlite2', 'sqlite3', '_sqlite3', 'sqlite'),
+    'sqlite': ('sqlite3', '_sqlite3'),
 }
+
 
 def get_backend(name):
     '''Get a specific backend by name.'''
-    vars = globals()
+    global_vars = globals()
     # if requested backend has been imported yet, return current instance
-    if name in vars:
-        return vars[name]
+    if name in global_vars:
+        return global_vars[name]
     # import the backend module
     module_name = 'back_%s' % name
-    module = __import__(module_name, vars, level=1)
-    vars[name] = module
+    module = __import__(module_name, global_vars, level=1)
+    global_vars[name] = module
     return module
+
 
 def have_backend(name):
     '''Is backend "name" available?'''
@@ -54,10 +54,14 @@ def have_backend(name):
         else:
             modname = e.args[0][16:] if e.args[0].startswith('No module named ') else None
 
+        # It's always ok if memorydb is not found
+        if modname.endswith('back_memorydb'):
+            return 0
         if modname and (modname in _modules.get(name, (name,))):
             return 0
         raise
     return 0
+
 
 def list_backends():
     '''List all available backend names.
@@ -65,11 +69,17 @@ def list_backends():
     This function has side-effect of registering backward-compatible
     globals for all available backends.
 
+    Note: Since memorydb does not live in the backends directory, it will
+    never be found in the default setup. It *can* be enabled by preloading
+    test/memorydb and injecting into roundup.backends. So the normal user
+    can never configure memorydb but it makes using the tests easier
+    because we do not need to monkey-patch list_backends.
+
     '''
-    l = []
-    for name in 'anydbm', 'mysql', 'sqlite', 'postgresql':
+    backend_list = []
+    for name in 'anydbm', 'mysql', 'sqlite', 'postgresql', 'memorydb':
         if have_backend(name):
-            l.append(name)
-    return l
+            backend_list.append(name)
+    return backend_list
 
 # vim: set filetype=python sts=4 sw=4 et si :

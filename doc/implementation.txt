@@ -1,3 +1,8 @@
+.. meta::
+    :description:
+        Additional implementation notes for the Roundup Issue Tracker.
+        Supplement for docstrings in the Roundup package.
+
 ====================
 Implementation notes
 ====================
@@ -49,5 +54,5 @@ In short:
 
 Back to `Table of Contents`_
 
-.. _`Table of Contents`: index.html
+.. _`Table of Contents`: ../docs.html
 

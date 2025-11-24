@@ -8,8 +8,13 @@
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
-import unittest, os, shutil, errno, sys, difflib, cgi, re
+import unittest, os, shutil, errno, sys, difflib, re
 from hashlib import sha1
+try:
+   from unittest.mock import Mock
+except ImportError:
+   # python 2.7
+   from mock import Mock
 
 from roundup import init, instance, password, hyperdb, date
 
@@ -57,6 +62,7 @@ class TestDatabase:
     classes = {'test': TestClass(), 'test2': TestClass2()}
     def getUserTimezone(self):
         return 0
+    config = Mock(PASSWORD_PBKDF2_DEFAULT_ROUNDS =  1000)
 
 class RawToHyperdbTest(unittest.TestCase):
     def _test(self, propname, value, itemid=None):
@@ -91,8 +97,12 @@ class RawToHyperdbTest(unittest.TestCase):
         self.assertTrue(isinstance(val, password.Password))
         val = self._test('password', '{plaintext}a string')
         self.assertTrue(isinstance(val, password.Password))
-        val = self._test('password', '{crypt}a string')
-        self.assertTrue(isinstance(val, password.Password))
+        try:
+           import crypt
+           val = self._test('password', '{crypt}a string')
+           self.assertTrue(isinstance(val, password.Password))
+        except ImportError:
+           pass
         s = sha1(b'a string').hexdigest()
         val = self._test('password', '{SHA}'+s)
         self.assertTrue(isinstance(val, password.Password))

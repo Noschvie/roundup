@@ -18,11 +18,9 @@
 """
 __docformat__ = 'restructuredtext'
 
-import sys
-
-
 # --- patch sys.path to make sure 'import roundup' finds correct version
 import os.path as osp
+import sys
 
 thisdir = osp.dirname(osp.abspath(__file__))
 rootdir = osp.dirname(osp.dirname(thisdir))
@@ -33,8 +31,8 @@ if (osp.exists(thisdir + '/__init__.py') and
 # --/
 
 
-# python version check
-from roundup import version_check
+# python version check - import exits if version invalid
+from roundup import version_check  # noqa: F401
 
 # import the admin tool guts and make it go
 from roundup.admin import AdminTool

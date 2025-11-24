@@ -1,13 +1,13 @@
 <tal:block metal:define-macro="icing">
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
+<meta tal:attributes="charset request/client/charset" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title metal:define-slot="head_title">title goes here</title>
 <link media="screen" href="@@file/defaultfonts.css" type="text/css" rel="alternate stylesheet" title="default fonts" />
+<meta name="description" content="Tracker for bugs and enhancements to the Roundup Issue Tracker software (https://www.roundup-tracker.org/). Yes, we eat our own dog food." />
 <link rel="stylesheet" type="text/css" href="@@file/style.css" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta http-equiv="Content-Type"
- tal:attributes="content string:text/html;; charset=${request/client/charset}" />
 <script tal:attributes="nonce request/client/client_nonce"
 	tal:replace="structure request/base_javascript">
 </script>
@@ -214,11 +214,9 @@ status_notresolved string:-1,1,2,4;
 <div class="footer">
 <div id="credits">
   <p>
-    Hosted on <a href="https://m.do.co/c/783434964889" title="Hosted on DigitalOcean">DigitalOcean</a>,
+    Supported by <a href="https://www.python.org/psf-landing/" title="The Python Software Foundation">The Python Software Foundation</a>,
     <br>
-    Supported by <a href="https://python.org/psf-landing/" title="The Python Software Foundation">The Python Software Foundation</a>,
-    <br>
-    Powered by <a href="http://roundup.sourceforge.net" title="Powered by the Roundup Issue Tracker">Roundup</a>
+    Powered by <a href="https://www.roundup-tracker.org" title="Powered by the Roundup Issue Tracker">Roundup</a>
   </p>
 </div> <!-- credits -->
 <!-- Created: Wed Jan 14 11:55:38 EST 2009 -->

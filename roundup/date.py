@@ -24,6 +24,8 @@ import calendar
 import datetime
 import re
 
+from roundup.anypy.datetime_ import utcnow
+
 try:
     import pytz
 except ImportError:
@@ -44,7 +46,7 @@ from roundup.anypy.strings import is_us
 date_re = re.compile(r'''^
     ((?P<y>\d\d\d\d)([/-](?P<m>\d\d?)([/-](?P<d>\d\d?))?)? # yyyy[-mm[-dd]]
     |(?P<a>\d\d?)[/-](?P<b>\d\d?))?              # or mm-dd
-    (?P<n>\.)?                                   # .
+    (?P<n>[.T])?                                 # . or T
     (((?P<H>\d?\d):(?P<M>\d\d))?(:(?P<S>\d\d?(\.\d+)?))?)?  # hh:mm:ss
     (?:(?P<tz>\s?[+-]\d{4})|(?P<o>[\d\smywd\-+]+))? # time-zone offset, offset
 $''', re.VERBOSE)
@@ -146,8 +148,12 @@ def get_timezone(tz):
             return SimpleTimezone(utcoffset)
     # tz is a timezone name
     if pytz:
-        return pytz.timezone(tz)
-    elif tz == "UTC":
+        try:
+            return pytz.timezone(tz)
+        except pytz.exceptions.UnknownTimeZoneError:
+            pass
+
+    if tz == "UTC":
         return UTC
     elif tz in _tzoffsets:
         return SimpleTimezone(_tzoffsets[tz], tz)
@@ -318,6 +324,9 @@ class Date:
         >>> test_fin(u)
     '''
 
+    __slots__ = ("year", "month", "day", "hour", "minute", "second",
+                 "_", "ngettext", "translator")
+    
     def __init__(self, spec='.', offset=0, add_granularity=False,
                  translator=i18n):
         """Construct a date given a specification and a time zone offset.
@@ -340,6 +349,9 @@ class Date:
                 self.year, self.month, self.day, self.hour, self.minute, \
                     self.second = spec.timetuple()[:6]
             else:
+                # FIXME: what is tz supposed to be? is it the trailing
+                # tz on the spec? Is it the offset?
+                tz = None
                 TZ = get_timezone(tz)
                 self.year, self.month, self.day, self.hour, self.minute, \
                     self.second = TZ.localize(spec).utctimetuple()[:6]
@@ -369,7 +381,7 @@ class Date:
     def now(self):
         """ To be able to override for testing
         """
-        return datetime.datetime.utcnow()
+        return utcnow()
 
     def set(self, spec, offset=0, date_re=date_re,
             serialised_re=serialised_date_re, add_granularity=False):

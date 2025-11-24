@@ -95,26 +95,45 @@ explanatory message given in the exception.
 from __future__ import print_function
 __docformat__ = 'restructuredtext'
 
-import base64, re, os, io, functools
-import time, sys, logging
-import traceback
+import base64
 import email
 import email.utils
+import functools
+import io
+import logging
+import os
+import re
+import sys
+import time
+import traceback
+
+import mailbox
+import socket
+import getpass
+import poplib
+import imaplib
+try:
+    import requests
+except ImportError:
+    requests = None
 from email.generator import Generator
 
+import roundup.anypy.random_ as random_
+import roundup.anypy.ssl_ as ssl_
+
+from roundup import configuration, date,  exceptions, hyperdb, i18n, password
 from roundup.anypy.email_ import decode_header, message_from_bytes, \
     message_from_binary_file
 from roundup.anypy.my_input import my_input
-
-from roundup import configuration, hyperdb, date, password, exceptions
-from roundup.mailer import Mailer
-from roundup.i18n import _
-from roundup.hyperdb import iter_roles
 from roundup.anypy.strings import StringIO, b2s, u2s
-import roundup.anypy.random_ as random_
+from roundup.hyperdb import iter_roles
+from roundup.i18n import _
+from roundup.logcontext import gen_trace_id, store_trace_reason
+from roundup.mailer import Mailer
+from roundup.dehtml import dehtml
 
 try:
-    import gpg, gpg.core, gpg.constants, gpg.constants.sigsum
+    import gpg, gpg.core, gpg.constants, gpg.constants.sigsum   # noqa: E401
 except ImportError:
     gpg = None
 
@@ -350,8 +369,8 @@ class RoundupMessage(email.message.Message):
                     if html_part:
                         # attachment should be added elsewhere.
                         pass
-                    elif content_found or content_type != \
-                         'multipart/alternative':
+                    elif (content_found or
+                          content_type != 'multipart/alternative'):
                         attachments.append(part.text_as_attachment())
                     elif html_part_found:
                         # text/plain part found after html
@@ -396,6 +415,23 @@ class RoundupMessage(email.message.Message):
             elif part.get_content_type() == 'text/plain':
                 return part.as_attachment()
         return None
+
+    def get_filename(self):
+        """ Note: The get_filename of the Message class returns just the
+            encoded header as transmitted via email. We make an attempt
+            here to decode the information returned and return the real
+            filename here.
+        """
+        # This should really use super() but doesn't work with python2
+        # because it seems that email.message.Message isn't a new-style
+        # class in python2
+        fn = email.message.Message.get_filename(self)
+        if not fn:
+            return fn
+        h = []
+        for x, t in decode_header(fn):
+            h.append(x.decode(t) if t else x)
+        return ''.join(h)
 
     def as_attachment(self):
         """Return this message as an attachment."""
@@ -544,10 +580,11 @@ class parsedMessage:
         '''
         if self.message.get_header('x-roundup-loop', ''):
             raise IgnoreLoop
-        if (self.message.get_header('precedence', '') == 'bulk'
-                or self.message.get_header('auto-submitted', 'no').rstrip().lower() \
-                         != 'no'
-                or self.subject.lower().find("autoreply") > 0):
+        if (
+                self.message.get_header('precedence', '') == 'bulk' or
+                self.message.get_header('auto-submitted',
+                                        'no').rstrip().lower() != 'no' or
+                self.subject.lower().find("autoreply") > 0):
             raise IgnoreBulk
 
     def handle_help(self):
@@ -577,9 +614,9 @@ Emails to Roundup trackers must include a Subject: line!
 
         sd_open, sd_close = self.config['MAILGW_SUBJECT_SUFFIX_DELIMITERS']
         delim_open = re.escape(sd_open)
-        if delim_open in '[(': delim_open = '\\' + delim_open
+        if delim_open in '[(': delim_open = '\\' + delim_open     # noqa: E701
         delim_close = re.escape(sd_close)
-        if delim_close in '[(': delim_close = '\\' + delim_close
+        if delim_close in '[(': delim_close = '\\' + delim_close  # noqa: E701
 
         # Look for Re: et. al. Used later on for MAILGW_SUBJECT_CONTENT_MATCH
         re_re = r"(?P<refwd>%s)\s*" % self.config["MAILGW_REFWD_RE"].pattern
@@ -600,12 +637,12 @@ Emails to Roundup trackers must include a Subject: line!
             tmpsubject = tmpsubject[len(self.matches['quote']):]
 
         # Check if the subject includes a prefix
-        self.has_prefix = re.search(r'^%s(\w+)%s' % (delim_open,
-                                                     delim_close),
+        self.has_prefix = re.search(r'^%s\s*(\w+)\s*%s' % (delim_open,
+                                                           delim_close),
                                     tmpsubject.strip())
 
         # Match the classname if specified
-        class_re = r'%s(?P<classname>(%s))(?P<nodeid>\d+)?%s' %  \
+        class_re = r'%s\s*(?P<classname>(%s))\s*(?P<nodeid>\d+)?\s*%s' %  \
                    (delim_open, "|".join(self.db.getclasses()),
                     delim_close)
         # Note: re.search, not re.match as there might be garbage
@@ -625,8 +662,8 @@ Emails to Roundup trackers must include a Subject: line!
         q = ''
         if self.matches['quote']:
             q = '"?'
-        args_re = r'(?P<argswhole>%s(?P<args>[^%s]*)%s)%s$' % (delim_open,
-            delim_close, delim_close, q)
+        args_re = r'(?P<argswhole>%s(?P<args>[^%s]*)%s)%s$' % (
+            delim_open, delim_close, delim_close, q)
         m = re.search(args_re, tmpsubject.strip(), re.IGNORECASE | re.VERBOSE)
         if m:
             self.matches.update(m.groupdict())
@@ -693,10 +730,7 @@ Subject was: '%(subject)s'
         if classname:
             attempts.append(classname)
 
-        if self.mailgw.default_class:
-            attempts.append(self.mailgw.default_class)
-        else:
-            attempts.append(self.config['MAILGW_DEFAULT_CLASS'])
+        attempts.append(self.mailgw.default_class)
 
         # first valid class name wins
         self.cl = None
@@ -747,11 +781,35 @@ Subject was: '%(subject)s'
             nodeid = self.matches['nodeid']
 
         # try in-reply-to to match the message if there's no nodeid
+        # If there are multiple matches for the in-reply-to, fall back
+        # to title/subject match.
         inreplyto = self.message.get_header('in-reply-to') or ''
         if nodeid is None and inreplyto:
-            l = self.db.getclass('msg').stringFind(messageid=inreplyto)
-            if l:
-                nodeid = self.cl.filter(None, {'messages': l})[0]
+            parent_message = self.db.getclass('msg').stringFind(
+                messageid=inreplyto)
+            if parent_message:
+                nodeid = self.cl.filter(None,
+                                        {'messages': parent_message})
+                if len(nodeid) == 1:
+                    nodeid = nodeid[0]
+                elif nodeid:   # len(nodeid) > 1
+                    # This message is responding to a message
+                    # we know about. But there is more than 1 issue
+                    # associated with it.
+                    # Before bouncing it or creating a new issue,
+                    # force it to be treated as a reply even if the Subject
+                    # is missing 'Re:'
+                    # Note that multiple issues may be matched by
+                    #   Subject as well. The code chooses the most
+                    #   recently updated.  Hopefully Subjects have
+                    #   less of a chance of collision. Possible future
+                    #   idea filter ids that match subject by id's
+                    #   that match in-reply-to and choose newest
+                    #   match. Not sure if this would work better in
+                    #   production, so not implementing now.
+                    nodeid = None
+                    # trigger Subject match
+                    self.matches['refwd'] = True
 
         # but we do need either a title or a nodeid...
         if nodeid is None and not title:
@@ -772,13 +830,13 @@ Subject was: "%(subject)s"
         # activity.
         tmatch_mode = self.config['MAILGW_SUBJECT_CONTENT_MATCH']
         if tmatch_mode != 'never' and nodeid is None and self.matches['refwd']:
-            l = self.cl.stringFind(title=title)
+            title_match_ids = self.cl.stringFind(title=title)
             limit = None
             if (tmatch_mode.startswith('creation') or
                     tmatch_mode.startswith('activity')):
                 limit, interval = tmatch_mode.split(' ', 1)
                 threshold = date.Date('.') - date.Interval(interval)
-            for id in l:
+            for id in title_match_ids:
                 if limit:
                     if threshold < self.cl.get(id, limit):
                         nodeid = id
@@ -850,7 +908,8 @@ Unknown address: %(from_address)s
         '''
         if self.nodeid:
             if not self.db.security.hasPermission('Edit', self.author,
-                    self.classname, itemid=self.nodeid):
+                                                  self.classname,
+                                                  itemid=self.nodeid):
                 raise Unauthorized(_(
                     'You are not permitted to edit %(classname)s.'
                     ) % self.__dict__)
@@ -951,8 +1010,8 @@ Subject was: "%(subject)s"
 
         # set the issue title to the subject
         title = title.strip()
-        if (title and 'title' in self.properties and 'title'
-            not in issue_props):
+        if (title and 'title' in self.properties and
+                'title' not in issue_props):
             issue_props['title'] = title
         if (self.nodeid and 'title' in self.properties and not
                 self.config['MAILGW_SUBJECT_UPDATES_TITLE']):
@@ -976,7 +1035,8 @@ Subject was: "%(subject)s"
                 or we will skip PGP processing
             """
             if self.config.PGP_ROLES:
-                return self.db.user.has_role(self.author,
+                return self.db.user.has_role(
+                    self.author,
                     *iter_roles(self.config.PGP_ROLES))
             else:
                 return True
@@ -1020,8 +1080,9 @@ Subject was: "%(subject)s"
                     # we get here. Try decrypting it again if we don't
                     # need signatures.
                     if encr_only:
-                        message = self.message.decrypt(author_address,
-                                               may_be_unsigned=encr_only)
+                        message = self.message.decrypt(
+                            author_address,
+                            may_be_unsigned=encr_only)
                     else:
                         # something failed with the message decryption/sig
                         # chain. Pass the error up.
@@ -1036,7 +1097,6 @@ encrypted."""))
     def get_content_and_attachments(self):
         ''' get the attachments and first text part from the message
         '''
-        from roundup.dehtml import dehtml
         html2text = dehtml(self.config['MAILGW_CONVERT_HTMLTOTEXT']).html2text
 
         ig = self.config.MAILGW_IGNORE_ALTERNATIVES
@@ -1071,8 +1131,11 @@ encrypted."""))
                 else:
                     files.append(fileid)
             # allowed to attach the files to an existing node?
-            if self.nodeid and not self.db.security.hasPermission('Edit',
-                    self.author, self.classname, 'files'):
+            if self.nodeid and \
+               not self.db.security.hasPermission('Edit',
+                                                  self.author,
+                                                  self.classname,
+                                                  'files'):
                 raise Unauthorized(_(
                     'You are not permitted to add files to %(classname)s.'
                     ) % self.__dict__)
@@ -1099,7 +1162,8 @@ encrypted."""))
         messageid = self.message.get_header('message-id')
         # generate a messageid if there isn't one
         if not messageid:
-            messageid = "<%s.%s.%s%s@%s>" % (time.time(),
+            messageid = "<%s.%s.%s%s@%s>" % (
+                time.time(),
                 b2s(base64.b32encode(random_.token_bytes(10))),
                 self.classname, self.nodeid, self.config['MAIL_DOMAIN'])
 
@@ -1120,7 +1184,8 @@ not find a text/plain part to use.
                     'You are not permitted to create messages.'))
 
             try:
-                message_id = self.db.msg.create(author=self.author,
+                message_id = self.db.msg.create(
+                    author=self.author,
                     recipients=self.recipients, date=date.Date('.'),
                     summary=summary, content=content,
                     messageid=messageid, inreplyto=inreplyto, **self.msg_props)
@@ -1130,8 +1195,11 @@ Mail message was rejected by a detector.
 %(error)s
 """) % locals())
             # allowed to attach the message to the existing node?
-            if self.nodeid and not self.db.security.hasPermission('Edit',
-                    self.author, self.classname, 'messages'):
+            if self.nodeid and \
+               not self.db.security.hasPermission('Edit',
+                                                  self.author,
+                                                  self.classname,
+                                                  'messages'):
                 raise Unauthorized(_(
                     'You are not permitted to add messages to %(classname)s.'
                     ) % self.__dict__)
@@ -1155,7 +1223,8 @@ Mail message was rejected by a detector.
                 for prop in self.props.keys():
                     if not self.db.security.hasPermission('Edit', self.author,
                                                           classname, prop):
-                        raise Unauthorized(_('You are not permitted to edit '
+                        raise Unauthorized(_(
+                            'You are not permitted to edit '
                             'property %(prop)s of class %(classname)s.') %
                                            locals())
                 self.cl.set(self.nodeid, **self.props)
@@ -1163,13 +1232,16 @@ Mail message was rejected by a detector.
                 # Check permissions for each property
                 for prop in self.props.keys():
                     if not self.db.security.hasPermission('Create',
-                                        self.author, classname, prop):
-                        raise Unauthorized(_('You are not permitted to set '
+                                                          self.author,
+                                                          classname,
+                                                          prop):
+                        raise Unauthorized(_(
+                            'You are not permitted to set '
                             'property %(prop)s of class %(classname)s.') %
                                            locals())
                 self.nodeid = self.cl.create(**self.props)
-        except (TypeError, IndexError,
-                ValueError, exceptions.Reject) as message:  # noqa: F841
+        except (TypeError, IndexError,                        # noqa: F841
+                ValueError, exceptions.Reject) as message:
             self.mailgw.logger.exception(
                      "Rejecting email due to node creation error:")
             raise MailUsageError(_("""
@@ -1253,13 +1325,14 @@ class MailGW:
     # class of MailGW
     parsed_message_class = parsedMessage
 
-    def __init__(self, instance, arguments=()):
+    def __init__(self, instance, arguments):
         self.instance = instance
         self.arguments = arguments
-        self.default_class = None
-        for option, value in self.arguments:
-            if option == '-c':
-                self.default_class = value.strip()
+        self.default_class = self.arguments.default_class.strip()
+        if not self.default_class:
+            self.default_class = instance.config['MAILGW_DEFAULT_CLASS']
+        self.props_by_class = {}
+        self.parse_set_value()
 
         self.mailer = Mailer(instance.config)
         self.logger = logging.getLogger('roundup.mailgw')
@@ -1267,6 +1340,35 @@ class MailGW:
         # should we trap exceptions (normal usage) or pass them through
         # (for testing)
         self.trapExceptions = 1
+
+    def parse_set_value(self):
+        """ Parse properties given with '-S' or --set-value option on
+            command line
+        """
+        errors = []
+        for v in self.arguments.set_value:
+            try:
+                n, r = v.split('=', 1)
+            except ValueError:
+                errors.append('"%s" is not of the form "property=value"' % v)
+                break
+            try:
+                classname, rv = n.split('.', 1)
+                r = '='.join((rv, r))
+            except ValueError:
+                classname = 'msg'
+                r = v
+            if classname not in self.props_by_class:
+                # We can only check later if this is a valid class
+                self.props_by_class[classname] = []
+            self.props_by_class[classname].append(r)
+        if errors:
+            mailadmin = self.instance.config['ADMIN_EMAIL']
+            raise MailUsageError(_("""
+The mail gateway is not properly set up. Please contact
+%(mailadmin)s and have them fix the incorrect properties:
+  %(errors)s
+""") % locals())
 
     def do_pipe(self):
         """ Read a message from standard input and pass it to the mail handler.
@@ -1290,8 +1392,6 @@ class MailGW:
         """ Read a series of messages from the specified unix mailbox file and
             pass each to the mail handler.
         """
-        import mailbox
-
         class mboxRoundupMessage(mailbox.mboxMessage, RoundupMessage):
             pass
 
@@ -1335,14 +1435,62 @@ class MailGW:
 
         return 0
 
-    def do_imap(self, server, user='', password='', mailbox='', ssl=0, cram=0):
+    def get_oauth_tokens(self, oauth_path):
+        if not oauth_path:
+            oauth_path = self.instance.config['TRACKER_HOME']
+            oauth_path = os.path.join(oauth_path, 'oauth')
+        self.oauth_path = oauth_path
+        with open(os.path.join(oauth_path, 'access_token'), 'r') as f:
+            self.access_token = f.read().strip()
+        with open(os.path.join(oauth_path, 'refresh_token'), 'r') as f:
+            self.refresh_token = f.read().strip()
+
+    def write_token(self, tokenname):
+        n = os.path.join(self.oauth_path, tokenname)
+        tmp = n + '.tmp'
+        old = n + '.old'
+        with open(tmp, 'w') as f:
+            f.write(getattr(self, tokenname))
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+        os.rename(n, old)
+        os.rename(tmp, n)
+
+    def renew_oauth_tokens(self):
+        """ Get new token(s) via refresh token
+        """
+        with open(os.path.join(self.oauth_path, 'client_secret'), 'r') as f:
+            client_secret = f.read().strip()
+        with open(os.path.join(self.oauth_path, 'client_id'), 'r') as f:
+            client_id = f.read().strip()
+        data = dict(
+            client_id=client_id,
+            client_secret=client_secret,
+            refresh_token=self.refresh_token,
+            grant_type='refresh_token'
+        )
+        session = requests.session()
+        r = session.post(self.token_endpoint, data=data)
+        if not 200 <= r.status_code <= 299:
+            raise RuntimeError('Invalid get result: %s: %s\n %s'
+                               % (r.status_code, r.reason, r.text))
+        d = r.json()
+        if d['refresh_token'] != self.refresh_token:
+            self.refresh_token = d['refresh_token']
+            self.write_token('refresh_token')
+        if d['access_token'] != self.access_token:
+            self.access_token = d['access_token']
+            self.write_token('access_token')
+
+    def do_imap(self, server, user='', password='', mailbox='', **kw):
         ''' Do an IMAP connection
         '''
-        import getpass, imaplib, socket
         try:
             if not user:
                 user = my_input('User: ')
-            if not password:
+            if not password and not kw.get('oauth'):
                 password = getpass.getpass()
         except (KeyboardInterrupt, EOFError):
             # Ctrl C or D maybe also Ctrl Z under Windows.
@@ -1350,24 +1498,50 @@ class MailGW:
             return 1
         # open a connection to the server and retrieve all messages
         try:
-            if ssl:
+            if kw.get('ssl'):
                 self.logger.debug('Trying server %r with ssl' % server)
                 server = imaplib.IMAP4_SSL(server)
             else:
                 self.logger.debug('Trying server %r without ssl' % server)
                 server = imaplib.IMAP4(server)
-        except (imaplib.IMAP4.error, socket.error, socket.sslerror):
+        except (imaplib.IMAP4.error, socket.error, ssl_.SSLError):
             self.logger.exception('IMAP server error')
             return 1
 
-        try:
-            if cram:
-                server.login_cram_md5(user, password)
-            else:
-                server.login(user, password)
-        except imaplib.IMAP4.error as e:
-            self.logger.exception('IMAP login failure: %s' % e)
-            return 1
+        if kw.get('oauth'):
+            if requests is None:
+                self.logger.error('For OAUTH, the requests library '
+                                  'must be installed')
+                return 1
+            self.get_oauth_tokens(kw.get('oauth_path'))
+            # The following are mandatory for oauth and are passed by
+            # the command-line handler:
+            self.token_endpoint = kw['token_endpoint']
+            for k in range(2):
+                t = self.access_token
+                s = 'user=%s\1auth=Bearer %s\1\1' % (user, t)
+                # Try twice, access token may be too old
+                try:
+                    server.authenticate('XOAUTH2', lambda x: s)
+                    break
+                except imaplib.IMAP4.error:
+                    if k:
+                        self.logger.exception('OAUTH authentication failed')
+                        return 1
+                try:
+                    self.renew_oauth_tokens()
+                except RuntimeError:
+                    self.logger.exception('OAUTH token renew failed')
+                    return 1
+        else:
+            try:
+                if kw.get('cram'):
+                    server.login_cram_md5(user, password)
+                else:
+                    server.login(user, password)
+            except imaplib.IMAP4.error as e:
+                self.logger.exception('IMAP login failure: %s' % e)
+                return 1
 
         try:
             if not mailbox:
@@ -1398,7 +1572,7 @@ class MailGW:
         finally:
             try:
                 server.expunge()
-            except (imaplib.IMAP4.error, socket.error, socket.sslerror):
+            except (imaplib.IMAP4.error, socket.error, ssl_.SSLError):
                 pass
             server.logout()
 
@@ -1417,7 +1591,6 @@ class MailGW:
     def _do_pop(self, server, user, password, apop, ssl):
         '''Read a series of messages from the specified POP server.
         '''
-        import getpass, poplib, socket
         # Monkey-patch poplib to have a large line-limit
         # Seems that in python2.7 poplib applies a line-length limit not
         # just to the lines that take care of the pop3 protocol but also
@@ -1444,7 +1617,7 @@ class MailGW:
             else:
                 klass = poplib.POP3
             server = klass(server)
-        except socket.error:
+        except (socket.error, ssl_.SSLError):
             self.logger.exception('POP server error')
             return 1
         if apop:
@@ -1474,6 +1647,8 @@ class MailGW:
         return self.handle_Message(message_from_binary_file(fp,
                                                             RoundupMessage))
 
+    @gen_trace_id()
+    @store_trace_reason("mailgw")
     def handle_Message(self, message):
         """Handle an RFC822 Message
 
@@ -1581,9 +1756,23 @@ class MailGW:
         ''' message - a Message instance
 
         Parse the message as per the module docstring.
+
+        WARNING: any changes in this code need to be moved to all
+        *Translate* test cases in test/test_mailgw.py. This method
+        can't be tested directly because it opens the instance
+        erasing the database mocked by the test harness.
+
         '''
         # get database handle for handling one email
         self.db = self.instance.open('admin')
+
+        language = self.instance.config["MAILGW_LANGUAGE"] or self.instance.config["TRACKER_LANGUAGE"]
+        self.db.i18n = i18n.get_translation(
+            language,
+            tracker_home=self.instance.config["TRACKER_HOME"])
+
+        global _
+        _ = self.db.i18n.gettext
 
         self.db.tx_Source = "email"
 
@@ -1621,60 +1810,37 @@ class MailGW:
             classname - the name of the current issue-type class
 
         Parse the commandline arguments and retrieve the properties that
-        are relevant to the class_type. We now allow multiple -S options
-        per class_type (-C option).
+        are relevant to the class_type.
         '''
         allprops = {}
 
         classname = classname or class_type
-        cls_lookup = {'issue': classname}
 
-        # Allow other issue-type classes -- take the real classname from
-        # previous parsing-steps of the message:
-        clsname = cls_lookup.get(class_type, class_type)
-
-        # check if the clsname is valid
+        # check if the classname is valid
         try:
-            self.db.getclass(clsname)
+            cls = self.db.getclass(classname)
         except KeyError:
             mailadmin = self.instance.config['ADMIN_EMAIL']
             raise MailUsageError(_("""
 The mail gateway is not properly set up. Please contact
 %(mailadmin)s and have them fix the incorrect class specified as:
-  %(clsname)s
+  %(classname)s
 """) % locals())
 
-        if self.arguments:
-            # The default type on the commandline is msg
-            if class_type == 'msg':
-                current_type = class_type
-            else:
-                current_type = None
+        if classname not in self.props_by_class:
+            return {}
+        for propstring in self.props_by_class[classname]:
+            errors, props = setPropArrayFromString(self, cls,
+                                                   propstring.strip())
 
-            # Handle the arguments specified by the email gateway command line.
-            # We do this by looping over the list of self.arguments looking for
-            # a -C to match the class we want, then use the -S setting string.
-            for option, propstring in self.arguments:
-                if option in ('-C', '--class'):
-                    current_type = propstring.strip()
-
-                    if current_type != class_type:
-                        current_type = None
-
-                elif current_type and option in ('-S', '--set'):
-                    cls = cls_lookup.get(current_type, current_type)
-                    temp_cl = self.db.getclass(cls)
-                    errors, props = setPropArrayFromString(self,
-                        temp_cl, propstring.strip())
-
-                    if errors:
-                        mailadmin = self.instance.config['ADMIN_EMAIL']
-                        raise MailUsageError(_("""
+            if errors:
+                mailadmin = self.instance.config['ADMIN_EMAIL']
+                raise MailUsageError(_("""
 The mail gateway is not properly set up. Please contact
 %(mailadmin)s and have them fix the incorrect properties:
   %(errors)s
 """) % locals())
-                    allprops.update(props)
+            allprops.update(props)
 
         return allprops
 
@@ -1776,8 +1942,9 @@ def uidFromAddress(db, address, create=1, **user_props):
 
         # create!
         try:
-            return db.user.create(username=trying, address=address,
-                realname=realname, roles=db.config.NEW_EMAIL_USER_ROLES,
+            return db.user.create(
+                username=trying, address=address, realname=realname,
+                roles=db.config.NEW_EMAIL_USER_ROLES,
                 password=password.Password(password.generatePassword(),
                                            config=db.config),
                 **user_props)
@@ -1852,7 +2019,7 @@ def parseContent(content, keep_citations=None, keep_body=None,
 
     # extract out the summary from the message
     summary = ''
-    l = []
+    kept_lines = []
     # find last non-empty section for signature matching
     last_nonempty = len(sections) - 1
     while last_nonempty and not sections[last_nonempty]:
@@ -1869,20 +2036,20 @@ def parseContent(content, keep_citations=None, keep_body=None,
             if ns and not quote_1st and lines[0] and not keep_citations:
                 # we drop only first-lines ending in ':' (e.g. 'XXX wrote:')
                 if not lines[0].endswith(':'):
-                    l.append(lines[0])
+                    kept_lines.append(lines[0])
             # see if there's a response somewhere inside this section (ie.
             # no blank line between quoted message and response)
-            for n, line in enumerate(lines[1:]):
+            for _n, line in enumerate(lines[1:]):
                 if line and line[0] not in '>|':
                     break
             else:
                 # we keep quoted bits if specified in the config
                 if keep_citations:
-                    l.append(section)
+                    kept_lines.append(section)
                 continue
             # keep this section - it has reponse stuff in it
             if not keep_citations:
-                lines = lines[n + 1:]
+                lines = lines[_n + 1:]
             section = '\n'.join(lines)
 
         is_last = ns == last_nonempty
@@ -1901,7 +2068,7 @@ def parseContent(content, keep_citations=None, keep_body=None,
             break
 
         # and add the section to the output
-        l.append(section)
+        kept_lines.append(section)
 
     # figure the summary - find the first sentence-ending punctuation or the
     # first whole line, whichever is longest
@@ -1916,8 +2083,8 @@ def parseContent(content, keep_citations=None, keep_body=None,
     # Now reconstitute the message content minus the bits we don't care
     # about.
     if not keep_body:
-        content = '\n\n'.join(l)
+        content = '\n\n'.join(kept_lines)
 
     return summary, content
 
-# vim: set filetype=python sts=4 sw=4 et si :
+# vim: set filetype=python sts=4 sw=4 et :

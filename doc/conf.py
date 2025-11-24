@@ -23,7 +23,7 @@ import os
 
 
 # Read Roundup version by importing it from parent directory,
-# this ensures that 'unkown version' is inserted even if
+# this ensures that 'unknown version' is inserted even if
 # `roundup` is importable from other location in sys.path
 SYSSAVE = sys.path
 DOCROOT = os.path.abspath(os.path.dirname(__file__))
@@ -51,6 +51,10 @@ finally:
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 #extensions = ['toctree']
+extensions = ['sphinx_tabs.tabs', 'sphinx.ext.autodoc']
+
+sphinx_tabs_valid_builders = ['linkcheck']
+sphinx_tabs_disable_tab_closing = True
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -68,7 +72,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'Roundup'
-copyright = u'2009-2020, Richard Jones, Roundup-Team'
+copyright = u'2009-2025, Richard Jones, Roundup-Team'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -84,7 +88,7 @@ release = VERSION
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = 'en'
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -95,9 +99,9 @@ language = None
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # see https://issues.roundup-tracker.org/issue2550907:
-exclude_patterns = ['_build',
-                    'announcement.txt', 'whatsnew-0.7.txt', 'whatsnew-0.8.txt',
-                    'security.txt' ]
+exclude_patterns = ['_build', 'tracker_config.txt',
+                    'announcement.txt', 'whatsnew-0.7.txt',
+                    'whatsnew-0.8.txt', 'CVE.txt']
 
 # The reST default role (used for this markup: `text`) to use for all
 # documents.
@@ -116,6 +120,13 @@ exclude_patterns = ['_build',
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
+
+# disable permalinks
+from sphinx import version_info
+if version_info < (3,5,0):
+    html_add_permalinks = ''
+else:
+    html_permalinks = False  # when sphinx > 3.5 is used.
 
 # A list of ignored prefixes for module index sorting.
 #modindex_common_prefix = []

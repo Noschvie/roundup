@@ -1,19 +1,19 @@
 from __future__ import print_function
-import unittest
-from cgi import FieldStorage, MiniFieldStorage
+import unittest, copy
 
 from roundup import hyperdb
 from roundup.date import Date, Interval
 from roundup.cgi.actions import *
 from roundup.cgi.client import add_message
-from roundup.cgi.exceptions import Redirect, Unauthorised, SeriousError, FormError
+from roundup.cgi.exceptions import RateLimitExceeded, Redirect, Unauthorised, SeriousError, FormError
 from roundup.exceptions import Reject
 
+from roundup.anypy.cgi_ import FieldStorage, MiniFieldStorage
 from roundup.anypy.cmp_ import NoneAndDictComparable
 from time import sleep
 from datetime import datetime
 
-from .mocknull import MockNull
+from roundup.test.mocknull import MockNull
 
 def true(*args, **kwargs):
     return 1
@@ -27,10 +27,11 @@ class ActionTestCase(unittest.TestCase):
         self.client.db.Otk.getall = self.data_get
         self.client.db.Otk.set = self.data_set
         self.client.db.config.WEB_LOGIN_ATTEMPTS_MIN = 20
+        self.client.db.config.WEB_LOGIN_EMPTY_PASSWORDS = 0
         self.client._ok_message = []
         self.client._error_message = []
-        self.client.add_error_message = lambda x : add_message(
-            self.client._error_message, x)
+        self.client.add_error_message = lambda x, escape=True: add_message(
+            self.client._error_message, x, escape=escape)
         self.client.add_ok_message = lambda x : add_message(
             self.client._ok_message, x)
         self.client.form = self.form
@@ -81,6 +82,16 @@ class ShowActionTestCase(ActionTestCase):
         self.form.value.append(MiniFieldStorage('@number', '1'))
         self.assertRaisesMessage(ValueError, action.handle,
             'No type specified')
+
+    def testShowActionBadNumber(self):
+        action = ShowAction(self.client)
+        self.assertRaises(ValueError, action.handle)
+        self.form.value.append(MiniFieldStorage('@number', 'A'))
+        self.form.value.append(MiniFieldStorage('@type', 'issue'))
+        with self.assertRaises(SeriousError) as ctx:
+            action.handle()
+        self.assertEqual('"A" is not an ID (issue ID required)',
+                         ctx.exception.args[0])
 
 class RetireActionTestCase(ActionTestCase):
     def testRetireAction(self):
@@ -239,11 +250,20 @@ class CollisionDetectionTestCase(ActionTestCase):
         # round off for testing
         self.now.second = int(self.now.second)
 
-    def testLastUserActivity(self):
+    def testLastUserActivityAt(self):
         self.assertEqual(self.action.lastUserActivity(), None)
 
+        # test @ special variable form
         self.client.form.value.append(
             MiniFieldStorage('@lastactivity', str(self.now)))
+        self.assertEqual(self.action.lastUserActivity(), self.now)
+
+    def testLastUserActivityColon(self):
+        self.assertEqual(self.action.lastUserActivity(), None)
+
+        # test : special variable form
+        self.client.form.value.append(
+            MiniFieldStorage(':lastactivity', str(self.now)))
         self.assertEqual(self.action.lastUserActivity(), self.now)
 
     def testLastNodeActivity(self):
@@ -262,9 +282,16 @@ class CollisionDetectionTestCase(ActionTestCase):
         # fake up an actual change
         self.action.classname = 'test'
         self.action.nodeid = '1'
-        self.client.parsePropsFromForm = lambda: ({('test','1'):{1:1}}, [])
-        self.assertTrue(self.action.detectCollision(self.now,
-            self.now + Interval("1d")))
+        self.client.parsePropsFromForm = lambda: (
+            {('test','1'):{"prop1":"1"}}, [])
+        props = self.action.detectCollision(self.now,
+                                            self.now + Interval("1d"))
+        self.assertTrue(props)
+        self.action.handleCollision(props)
+        self.assertEqual(self.client._error_message[0],
+                         'Edit Error: someone else has edited this test '
+                         '(prop1). View <a target="_blank" href="test1">their '
+                         'changes</a> in a new window.')
         self.assertFalse(self.action.detectCollision(self.now,
             self.now - Interval("1d")))
         self.assertFalse(self.action.detectCollision(None, self.now))
@@ -345,6 +372,27 @@ class LoginTestCase(ActionTestCase):
 
         self.assertLoginLeavesMessages([], 'foo', 'right')
 
+    def testBlankPasswordLogin(self):
+        self.client.db.security.hasPermission = lambda *args, **kwargs: True
+
+        self.client.db.user.get = lambda a,b: None
+
+        def opendb(username):
+            self.assertEqual(username, 'blank')
+        self.client.opendb = opendb
+
+        self.assertEqual(self.client.db.config.WEB_LOGIN_EMPTY_PASSWORDS, 0)
+        self.assertLoginLeavesMessages(['Invalid login'], 'blank', '' )
+
+        self.client.db.config.WEB_LOGIN_EMPTY_PASSWORDS = 1
+        self.form.value[:] = []  # reset form
+        self.client._error_message = [] # reset errors
+        self.assertLoginLeavesMessages([], 'blank', '' )
+
+        # reset
+        self.client.db.user.get = lambda a,b: 'right'
+        self.client.db.config.WEB_LOGIN_EMPTY_PASSWORDS = 0
+
     def testCorrectLoginRedirect(self):
         self.client.db.security.hasPermission = lambda *args, **kwargs: True
         def opendb(username):
@@ -352,22 +400,22 @@ class LoginTestCase(ActionTestCase):
         self.client.opendb = opendb
 
         # basic test with query
-        self.assertLoginRaisesRedirect("http://whoami.com/path/issue?%40action=search",
+        self.assertLoginRaisesRedirect("http://whoami.com/path/issue?%40action=search&%40ok_message=Welcome+foo%21",
                                  'foo', 'right', "http://whoami.com/path/issue?@action=search")
 
         # test that old messages are removed
         self.form.value[:] = []         # clear out last test's setup values
-        self.assertLoginRaisesRedirect("http://whoami.com/path/issue?%40action=search",
+        self.assertLoginRaisesRedirect("http://whoami.com/path/issue?%40action=search&%40ok_message=Welcome+foo%21",
                                  'foo', 'right', "http://whoami.com/path/issue?@action=search&@ok_messagehurrah+we+win&@error_message=blam")
 
         # test when there is no query
         self.form.value[:] = []         # clear out last test's setup values
-        self.assertLoginRaisesRedirect("http://whoami.com/path/issue255",
+        self.assertLoginRaisesRedirect("http://whoami.com/path/issue255?%40ok_message=Welcome+foo%21",
                                  'foo', 'right', "http://whoami.com/path/issue255")
 
         # test if we are logged out; should kill the @action=logout
         self.form.value[:] = []         # clear out last test's setup values
-        self.assertLoginRaisesRedirect("http://whoami.com/path/issue39?%40pagesize=50&%40startwith=0",
+        self.assertLoginRaisesRedirect("http://whoami.com/path/issue39?%40ok_message=Welcome+foo%21&%40pagesize=50&%40startwith=0",
                                  'foo', 'right', "http://whoami.com/path/issue39?@action=logout&@pagesize=50&@startwith=0")
 
     def testInvalidLoginRedirect(self):
@@ -405,12 +453,14 @@ class LoginTestCase(ActionTestCase):
         '''
         # Do the first login setting an invalid login name
         self.assertLoginLeavesMessages(['Invalid login'], 'nouser')
-        # use up the rest of the 20 login attempts
+        # use up the rest of the 20 login attempts. Login name
+        # persists.
         for i in range(19):
             self.client._error_message = []
             self.assertLoginLeavesMessages(['Invalid login'])
 
-        self.assertRaisesMessage(Reject, LoginAction(self.client).handle,
+        self.assertRaisesMessage(RateLimitExceeded,
+                                 LoginAction(self.client).handle,
                'Logins occurring too fast. Please wait: 3 seconds.')
 
         sleep(3) # sleep as requested so we can do another login
@@ -418,7 +468,8 @@ class LoginTestCase(ActionTestCase):
         self.assertLoginLeavesMessages(['Invalid login']) # this is expected
         
         # and make sure we need to wait another three seconds
-        self.assertRaisesMessage(Reject, LoginAction(self.client).handle,
+        self.assertRaisesMessage(RateLimitExceeded,
+                                 LoginAction(self.client).handle,
                'Logins occurring too fast. Please wait: 3 seconds.')
 
     def testLoginRateLimitOff(self):

@@ -129,8 +129,8 @@ status_notresolved string:-1,1,2,3,4,5,6,7;
         tal:attributes="action request/base">
    <p class="userblock">
     <b i18n:translate="">Login</b><br>
-    <input size="10" name="__login_name"><br>
-    <input size="10" type="password" name="__login_password"><br>
+    <input size="10" required name="__login_name"><br>
+    <input size="10" type="password" spellcheck="false" required name="__login_password"><br>
     <input name="@csrf" type="hidden"
            tal:attributes="value python:utils.anti_csrf_nonce()">
     <input type="hidden" name="@action" value="Login">
@@ -186,6 +186,7 @@ status_notresolved string:-1,1,2,3,4,5,6,7;
 <pre tal:condition="request/form/debug | nothing" tal:content="request">
 </pre>
 
+<script type="text/javascript" src='@@file/datecopy.min.js'></script>
 </body>
 </html>
 </tal:block>
@@ -330,7 +331,7 @@ See user.item.html in the classic template for examples.
 
 <!-- src: value will be re-used for other input fields -->
 <input metal:define-macro="user_src_input"
-    type="text" tal:attributes="onblur python:edit_ok and 'split_name(this)';
+    type="text" tal:attributes="onblur python:'split_name(this)' if edit_ok else '';
     id name; name name; value value; readonly not:edit_ok"
     value="heinz.kunz">
 <!-- normal: no re-using -->
@@ -338,8 +339,8 @@ See user.item.html in the classic template for examples.
     tal:attributes="id name; name name; value value; readonly not:edit_ok"
     value="heinz">
 <!-- password: type; no initial value -->
-    <input metal:define-macro="user_pw_input" type="password"
+    <input metal:define-macro="user_pw_input" spellcheck="false" type="password"
     tal:attributes="id name; name name; readonly not:edit_ok" value="">
-    <input metal:define-macro="user_confirm_input" type="password"
-    tal:attributes="id name; name string:@confirm@$name; readonly not:edit_ok" value="">
+    <input metal:define-macro="user_confirm_input" spellcheck="false" type="password"
+    tal:attributes="id string:confirm_$name; name string:@confirm@$name; readonly not:edit_ok" value="">
 

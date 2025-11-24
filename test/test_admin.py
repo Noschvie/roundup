@@ -5,11 +5,20 @@
 #
 
 from __future__ import print_function
-import unittest, os, shutil, errno, sys, difflib, cgi, re
+import difflib
+import errno
+import fileinput
+import io
+import os
+import platform
+import pytest
+import re
+import shutil
+import sys
+import unittest
 
 from roundup.admin import AdminTool
 
-from . import db_test_base
 from .test_mysql import skip_mysql
 from .test_postgresql import skip_postgresql
 
@@ -46,12 +55,45 @@ def normalize_file(filename, skiplines = [ None ]):
                     f.write(i)
         f.truncate()
 
+def replace_in_file(filename, original, replacement):
+    """replace text in a file. All occurances of original
+       will be replaced by replacement"""
+
+    for line in fileinput.input(filename, inplace = 1): 
+        print(line.replace(original, replacement))
+
+    fileinput.close()
+
+def find_in_file(filename, regexp):
+    """search for regexp in file.
+       If not found return false. If found return match.
+    """
+    with open(filename) as f:
+        contents = f.read()
+
+    try:
+        # handle text files with \r\n line endings
+        contents.index("\r", 0, 100)
+        contents = contents.replace("\r\n", "\n")
+    except ValueError:
+        pass
+
+    m = re.search(regexp, contents, re.MULTILINE)
+
+    if not m: return False
+
+    return m.group(0)
+
 class AdminTest(object):
 
     backend = None
 
     def setUp(self):
         self.dirname = '_test_admin'
+
+    @pytest.fixture(autouse=True)
+    def inject_fixtures(self, monkeypatch):
+        self._monkeypatch = monkeypatch
 
     def tearDown(self):
         try:
@@ -95,13 +137,83 @@ class AdminTest(object):
         self.assertEqual(ret, 0)
 
 
+    def testBasicInteractive(self):
+        # first command is an error that should be handled
+        inputs = iter(["'quit", "quit"])
+
+        orig_input = AdminTool.my_input
+
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        # set history_features to disable loading/saving history
+        # and loading rc file. Otherwise file gets large and
+        # breaks testing or overwrites the users history file.
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = 'ready for input.\nType "help" for help.'
+        # back up by 30 to make sure 'ready for input' in slice.
+        self.assertIn(expected,
+                      "\n".join(out.split('\n')[-3:-1]))
+
+        inputs = iter(["list user", "q"])
+
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = '   1: admin\n   2: anonymous'
+
+        self.assertEqual(expected,
+                         "\n".join(out.split('\n')[-2:]))
+
+
+        AdminTool.my_input = orig_input
+
+        # test EOF exit
+        inputs = ["help"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        # preserve directory self.install_init()
+        self.admin=AdminTool()
+
+        # disable all features
+        self.admin.settings['history_features'] = 7
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        # 4 includes 2 commands in saved history
+        expected = 'roundup> exit...'
+        self.assertIn(expected, out)
+
     def testGet(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.install_init()
         self.admin=AdminTool()
 
@@ -128,6 +240,18 @@ class AdminTest(object):
 
         self.admin=AdminTool()
         with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'create', 'issue',
+                      'title="bar foo bar"', 'assignedto=admin',
+                      'superseder=1,2']
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '3')
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
             sys.argv=['main', '-i', self.dirname, 'get', 'assignedto',
                       'issue2' ]
             ret = self.admin.main()
@@ -140,6 +264,32 @@ class AdminTest(object):
 
         self.admin=AdminTool()
         with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-d',
+                      'get', 'assignedto',
+                      'issue2' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        self.assertEqual(out, 'user2')
+        self.assertEqual(len(err), 0)
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-d', '-S', ':',
+                      'get', 'assignedto',
+                      'issue2' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        self.assertEqual(out, 'user2')
+        self.assertEqual(len(err), 0)
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
             sys.argv=['main', '-i', self.dirname, 'get', 'superseder',
                       'issue2' ]
             ret = self.admin.main()
@@ -148,6 +298,57 @@ class AdminTest(object):
         out = out.getvalue().strip()
         err = err.getvalue().strip()
         self.assertEqual(out, "['1']")
+        self.assertEqual(len(err), 0)
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'get', 'superseder',
+                      'issue3' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        self.assertEqual(out, "['1', '2']")
+        self.assertEqual(len(err), 0)
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-d',
+                      'get', 'superseder',
+                      'issue3' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        self.assertEqual(out, "issue1\nissue2")
+        self.assertEqual(len(err), 0)
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-c', '-d',
+                      'get', 'superseder',
+                      'issue3' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        self.assertEqual(out, "issue1,issue2")
+        self.assertEqual(len(err), 0)
+
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-d',
+                      'get', 'title',
+                      'issue3' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 1)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        self.assertEqual(out.split('\n')[0], "Error: property title is not of type Multilink or Link so -d flag does not apply.")
         self.assertEqual(len(err), 0)
 
         self.admin=AdminTool()
@@ -187,8 +388,21 @@ class AdminTest(object):
         self.assertEqual(out.index(expected_err), 0)
         self.assertEqual(len(err), 0)
 
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'get', 'title', 'issue500']
+            ret = self.admin.main()
+
+        expected_err = 'Error: no such issue node "500"'
+
+        self.assertEqual(ret, 1)
+        out = out.getvalue().strip()
+        err = err.getvalue().strip()
+        print(out)
+        self.assertEqual(out.index(expected_err), 0)
+        self.assertEqual(len(err), 0)
+
     def testInit(self):
-        import sys
         self.admin=AdminTool()
         sys.argv=['main', '-i', self.dirname, 'install', 'classic', self.backend]
         ret = self.admin.main()
@@ -197,8 +411,21 @@ class AdminTest(object):
         self.assertTrue(os.path.isfile(self.dirname + "/config.ini"))
         self.assertTrue(os.path.isfile(self.dirname + "/schema.py"))
 
+        nopath= '/tmp/noSuchDirectory/nodir'
+        norealpath = os.path.realpath(nopath + "/..")
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', nopath, 'install', 'classic', self.backend]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(ret)
+        print(out)
+        self.assertEqual(ret, 1)
+        self.assertIn('Error: Instance home parent directory '
+                      '"%s" does not exist' % norealpath, out)
+
     def testInitWithConfig_ini(self):
-        import sys
         from roundup.configuration import CoreConfig
         self.admin=AdminTool()
         sys.argv=['main', '-i', self.dirname, 'install', 'classic', self.backend]
@@ -227,15 +454,96 @@ class AdminTest(object):
         self.assertTrue(os.path.isfile(self.dirname + "/config.ini"))
         self.assertTrue(os.path.isfile(self.dirname + "/schema.py"))
         config=CoreConfig(self.dirname)
-        self.assertEqual(config['MAIL_DEBUG'], self.dirname + "/SendMail.LOG")
+        self.assertEqual(config['MAIL_DEBUG'],
+                         os.path.normpath(self.dirname + "/SendMail.LOG"))
+
+    def testList(self):
+        ''' Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+        self.install_init()
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'list', 'user',
+                      'username' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '1: admin\n   2: anonymous')
+
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-c',
+                      'list', 'user' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '1,2')
+
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-c',
+                      'list', 'user', 'username' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, 'admin,anonymous')
+
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-c',
+                      'list', 'user', 'roles' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 0)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, 'Admin,Anonymous')
+
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'list', 'user',
+                      'foo' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 1)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out.split('\n')[0],
+                         'Error: user has no property "foo"')
+
+
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-c',
+                      'list', 'user',
+                      'bar' ]
+            ret = self.admin.main()
+
+        self.assertEqual(ret, 1)
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out.split('\n')[0],
+                         'Error: user has no property "bar"')
 
     def testFind(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.admin=AdminTool()
         self.install_init()
 
@@ -300,12 +608,40 @@ class AdminTest(object):
         # so eval to real list so Equal can do a list compare
         self.assertEqual(sorted(eval(out)), ['1', '2'])
 
+        # Reopen the db closed by previous filter call
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            ''' 1,2 should return all entries that have assignedto
+                either admin or anonymous
+            '''
+            sys.argv=['main', '-i', self.dirname, '-c', '-d',
+                      'find', 'issue', 'assignedto=admin,anonymous']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, "issue1,issue2")
+
+        # Reopen the db closed by previous filter call
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            ''' 1,2 should return all entries that have assignedto
+                either admin or anonymous
+            '''
+            sys.argv=['main', '-i', self.dirname, '-S', ':',
+                      'find', 'issue', 'assignedto=admin,anonymous']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, "1:2")
+
     def testGenconfigUpdate(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys, filecmp
+        import filecmp
 
         self.admin=AdminTool()
         self.install_init()
@@ -364,14 +700,107 @@ class AdminTest(object):
         self.assertTrue(filecmp.cmp(self.dirname + "/config.ini",
                                     self.dirname + "/foo2.ini"))
 
+    def testUpdateconfigPbkdf2(self):
+        ''' Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+        import filecmp
+
+        self.admin=AdminTool()
+        self.install_init()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'updateconfig',
+                      self.dirname + "/config2.ini"]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, "")
+        self.assertTrue(os.path.isfile(self.dirname + "/config2.ini"))
+        # Autogenerated date header is different. Remove it
+        # so filecmp passes.
+        normalize_file(self.dirname + "/config2.ini",
+                       [ '# Autogenerated at' ])
+        normalize_file(self.dirname + "/config.ini",
+                       [ '# Autogenerated at' ])
+
+        self.assertTrue(filecmp.cmp(self.dirname + "/config.ini",
+                                    self.dirname + "/config2.ini"))
+
+        # Reopen the db closed by previous call
+        self.admin=AdminTool()
+
+        ### test replacement of old default value
+        replace_in_file(self.dirname + "/config.ini",
+                        "= 250000", "= 10000")
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'update',
+                      self.dirname + "/config2.ini"]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        expected = "from old default of 10000 to new default of 250000."
+
+        self.assertIn(expected, out)
+        self.assertTrue(os.path.isfile(self.dirname + "/config2.ini"))
+        self.assertEqual(find_in_file(self.dirname + "/config2.ini",
+                                     "^password_.*= 250000$"),
+                         "password_pbkdf2_default_rounds = 250000")
+
+        # Reopen the db closed by previous call
+        self.admin=AdminTool()
+
+        ### test replacement of too small value
+        replace_in_file(self.dirname + "/config.ini",
+                        "= 10000", "= 10001")
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'update',
+                      self.dirname + "/config2.ini"]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        expected = ("Update 'password_pbkdf2_default_rounds' to a number "
+                    "equal to or larger\n  than 250000.")
+
+        self.assertIn(expected, out)
+        self.assertTrue(os.path.isfile(self.dirname + "/config2.ini"))
+        self.assertEqual(find_in_file(self.dirname + "/config2.ini",
+                                     "^password_.*= 10001$"),
+                         "password_pbkdf2_default_rounds = 10001")
+
+
+        # Reopen the db closed by previous call
+        self.admin=AdminTool()
+
+        ### test no action if value is large enough
+        replace_in_file(self.dirname + "/config.ini",
+                        "= 10001", "= 2000001")
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'update',
+                      self.dirname + "/config2.ini"]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        expected = ""
+
+        self.assertEqual(expected, out)
+        self.assertTrue(os.path.isfile(self.dirname + "/config2.ini"))
+        self.assertEqual(find_in_file(self.dirname + "/config2.ini",
+                                     "^password_.*= 2000001$"),
+                         "password_pbkdf2_default_rounds = 2000001")
+
 
     def testCliParse(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.admin=AdminTool()
         self.install_init()
 
@@ -444,8 +873,6 @@ class AdminTest(object):
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.admin=AdminTool()
         self.install_init()
 
@@ -658,6 +1085,350 @@ class AdminTest(object):
         print(err.getvalue().strip())
         self.assertEqual(out, "issue1:issue2")
 
+        # Reopen the db closed by previous filter call
+        # 
+        # case: transitive property invalid match
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname,
+                      '-d', 'filter', 'issue',
+                      'assignedto.username=A']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print("me: " + out)
+        print(err.getvalue().strip())
+        self.assertEqual(out, "['issue1', 'issue2']")
+
+    def testPragma_reopen_tracker(self):
+        """test that _reopen_tracker works.
+        """
+        if self.backend not in ['anydbm']:
+            self.skipTest("For speed only run test with anydbm.")
+
+        orig_input = AdminTool.my_input
+
+        # must set verbose to see _reopen_tracker hidden setting.
+        # and to get "Reopening tracker" verbose log output
+        inputs = iter(["pragma verbose=true", "pragma list", "exit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = '   _reopen_tracker=False'
+        self.assertIn(expected, out)
+        self.assertIn('descriptions...', out[-1])
+        self.assertNotIn('Reopening tracker', out)
+
+        # -----
+        inputs = iter(["pragma verbose=true", "pragma _reopen_tracker=True",
+                       "pragma list", "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        self.assertEqual('Reopening tracker', out[3])
+        expected = '   _reopen_tracker=True'
+        self.assertIn(expected, out)
+
+        # -----
+        AdminTool.my_input = orig_input
+
+    def testPragma(self):
+        """Uses interactive mode since pragmas only apply when using multiple
+           commands.
+        """
+        if self.backend not in ['anydbm']:
+            self.skipTest("For speed only run test with anydbm.")
+
+        orig_input = AdminTool.my_input
+
+        for i in ["oN", "1", "yeS", "True"]:
+            inputs = iter(["pragma verbose=%s" % i, "pragma list", "quit"])
+            AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+            self.install_init()
+            self.admin=AdminTool()
+            self.admin.settings['history_features'] = 2
+            sys.argv=['main', '-i', self.dirname]
+
+            with captured_output() as (out, err):
+                ret = self.admin.main()
+
+            out = out.getvalue().strip().split('\n')
+
+            print(ret)
+            self.assertTrue(ret == 0)
+            expected = '   verbose=True'
+            self.assertIn(expected, out)
+            self.assertIn('descriptions...', out[-1])
+
+        # -----
+        for i in ["oFf", "0", "NO", "FalSe"]:
+            inputs = iter(["pragma verbose=true", "pragma verbose=%s" % i,
+                           "pragma list", "quit"])
+            AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+            self.install_init()
+            self.admin=AdminTool()
+            self.admin.settings['history_features'] = 2
+            sys.argv=['main', '-i', self.dirname]
+
+            with captured_output() as (out, err):
+                ret = self.admin.main()
+
+            out = out.getvalue().strip().split('\n')
+
+            print(ret)
+            self.assertTrue(ret == 0)
+            expected = '   verbose=False'
+            self.assertIn(expected, out)
+
+        # -----  test syntax errors
+        inputs = iter(["pragma", "pragma arg",
+                       "pragma foo=3","quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = 'Error: Not enough arguments supplied'
+        self.assertIn(expected, out)
+        expected = 'Error: Argument must be setting=value, was given: arg.'
+        self.assertIn(expected, out)
+        expected = 'Error: Unknown setting foo. Try "pragma list".'
+        self.assertIn(expected, out)
+
+        # -----
+        inputs = iter(["pragma verbose=foo", "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = 'Error: Incorrect value for boolean setting verbose: foo.'
+        self.assertIn(expected, out)
+
+        # -----
+        inputs = iter(["pragma verbose=on", "pragma _inttest=5",
+                       "pragma list", "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = '   _inttest=5'
+        self.assertIn(expected, out)
+        self.assertIn('descriptions...', out[-1])
+
+
+        # -----
+        inputs = iter(["pragma verbose=on", "pragma _inttest=fred",
+                       "pragma list", "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+        expected = 'Error: Incorrect value for integer setting _inttest: fred.'
+        self.assertIn(expected, out)
+        self.assertIn('descriptions...', out[-1])
+
+        # -----
+        inputs = iter(["pragma indexer_backend=whoosh", "pragma list",
+                       "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        expected = '   indexer_backend=whoosh'
+        self.assertIn(expected, out)
+
+        # -----
+        inputs = iter(["pragma _floattest=4.5", "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        expected = 'Error: Internal error: pragma can not handle values of type: float'
+        self.assertIn(expected, out)
+
+
+        # -----
+        inputs = iter(["pragma display_protected=yes",
+                       "display user1",
+                       "quit"])
+        AdminTool.my_input = lambda _self, _prompt: next(inputs)
+
+        self.install_init()
+        self.admin=AdminTool()
+        self.admin.settings['history_features'] = 2
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        
+        print(ret)
+        expected = '\n*creation: '
+        self.assertIn(expected, out)
+
+        # -----
+        AdminTool.my_input = orig_input
+
+    def testReindex(self):
+        ''' Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+        self.install_init()
+
+        # create an issue
+        self.admin=AdminTool()
+        sys.argv=['main', '-i', self.dirname, 'create', 'issue',
+                  'title="foo bar"', 'assignedto=admin' ]
+        ret = self.admin.main()
+
+        # reindex everything
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'reindex']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(len(out))
+        print(repr(out))
+        # make sure priority is being reindexed
+        self.assertIn('Reindex priority 40%', out)
+
+
+        # reindex whole class
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'reindex', 'issue']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(len(out))
+        print(repr(out))
+        self.assertEqual(out,
+                         'Reindex issue  0%                                                          \rReindex issue 100%                                                         \rReindex issue done')
+        self.assertEqual(len(out), 170)
+
+        # reindex one item
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'reindex', 'issue1']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(len(out))
+        print(repr(out))
+        # no output when reindexing just one item
+        self.assertEqual(out, '')
+
+        # reindex range
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'reindex', 'issue:1-4']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(repr(out))
+        self.assertIn('no such item "issue3"', out)
+
+        # reindex bad class
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'reindex', 'issue1-4']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(repr(out))
+        self.assertIn('Error: no such class "issue1-4"', out)
+
+        # reindex bad item
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'reindex', 'issue14']
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(repr(out))
+        self.assertIn('Error: no such item "issue14"', out)
 
     def disabletestHelpInitopts(self):
 
@@ -665,8 +1436,6 @@ class AdminTest(object):
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.install_init()
         self.admin=AdminTool()
 
@@ -683,13 +1452,235 @@ class AdminTest(object):
         self.assertTrue(expected[0] in out)
         self.assertTrue("Back ends:" in out)
 
+    def testSecurityListOne(self):
+        self.install_init()
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            # make sure UsEr returns result for user. Roles are
+            # lower cased interally
+            sys.argv=['main', '-i', self.dirname, 'security', "user" ]
+            ret = self.admin.main()
+
+            result = """Role "user":
+ User may use the email interface (Email Access)
+ User may access the rest interface (Rest Access)
+ User may access the web interface (Web Access)
+ User may access the xmlrpc interface (Xmlrpc Access)
+ User is allowed to create file (Create for "file" only)
+ User is allowed to edit file (Edit for "file" only)
+ User is allowed to access file (View for "file" only)
+ User is allowed to create issue (Create for "issue" only)
+ User is allowed to edit issue (Edit for "issue" only)
+ User is allowed to access issue (View for "issue" only)
+ User is allowed to create keyword (Create for "keyword" only)
+ User is allowed to edit keyword (Edit for "keyword" only)
+ User is allowed to access keyword (View for "keyword" only)
+ User is allowed to create msg (Create for "msg" only)
+ User is allowed to edit msg (Edit for "msg" only)
+ User is allowed to access msg (View for "msg" only)
+ User is allowed to access priority (View for "priority" only)
+ User is allowed to create queries (Create for "query" only)
+ User is allowed to edit their queries (Edit for "query" only)
+ User is allowed to restore their queries (Restore for "query" only)
+ User is allowed to retire their queries (Retire for "query" only)
+  (Search for "query" only)
+ User is allowed to view their own and public queries (View for "query" only)
+ User is allowed to access status (View for "status" only)
+ User is allowed to edit their own user details (Edit for "user": ('username', 'password', 'address', 'realname', 'phone', 'organisation', 'alternate_addresses', 'queries', 'timezone') only)
+  (View for "user": ('id', 'organisation', 'phone', 'realname', 'timezone', 'username') only)
+ User is allowed to view their own user details (View for "user" only)
+"""
+        print(out.getvalue())
+
+        self.assertEqual(result, out.getvalue())
+        self.assertEqual(ret, 0)
+
+
+        # test 2 all role names are lower case, make sure
+        # any role name is correctly lower cased
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'security', "UsEr" ]
+            ret = self.admin.main()
+
+        print(out.getvalue())
+
+        self.assertEqual(result, out.getvalue())
+        self.assertEqual(ret, 0)
+
+        # test 3 Check error if role does not exist
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'security', "NoSuch Role" ]
+            ret = self.admin.main()
+
+        result='No such Role "NoSuch Role"\n'
+        print('>', out.getvalue())
+
+        self.assertEqual(result, out.getvalue())
+        self.assertEqual(ret, 1)
+
+
+    def testSecurityListAll(self):
+        ''' Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+        self.install_init()
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'security' ]
+            ret = self.admin.main()
+
+        result = """New Web users get the Role "User"
+New Email users get the Role "User"
+Role "admin":
+ User may create everything (Create)
+ User may edit everything (Edit)
+ User may use the email interface (Email Access)
+ User may access the rest interface (Rest Access)
+ User may restore everything (Restore)
+ User may retire everything (Retire)
+ User may view everything (View)
+ User may access the web interface (Web Access)
+ User may manipulate user Roles through the web (Web Roles)
+ User may access the xmlrpc interface (Xmlrpc Access)
+Role "anonymous":
+ User may access the web interface (Web Access)
+ User is allowed to access file (View for "file" only)
+ User is allowed to access issue (View for "issue" only)
+ User is allowed to access keyword (View for "keyword" only)
+ User is allowed to access msg (View for "msg" only)
+ User is allowed to access priority (View for "priority" only)
+ User is allowed to access status (View for "status" only)
+ User is allowed to register new user (Register for "user" only)
+  (Search for "user" only)
+Role "user":
+ User may use the email interface (Email Access)
+ User may access the rest interface (Rest Access)
+ User may access the web interface (Web Access)
+ User may access the xmlrpc interface (Xmlrpc Access)
+ User is allowed to create file (Create for "file" only)
+ User is allowed to edit file (Edit for "file" only)
+ User is allowed to access file (View for "file" only)
+ User is allowed to create issue (Create for "issue" only)
+ User is allowed to edit issue (Edit for "issue" only)
+ User is allowed to access issue (View for "issue" only)
+ User is allowed to create keyword (Create for "keyword" only)
+ User is allowed to edit keyword (Edit for "keyword" only)
+ User is allowed to access keyword (View for "keyword" only)
+ User is allowed to create msg (Create for "msg" only)
+ User is allowed to edit msg (Edit for "msg" only)
+ User is allowed to access msg (View for "msg" only)
+ User is allowed to access priority (View for "priority" only)
+ User is allowed to create queries (Create for "query" only)
+ User is allowed to edit their queries (Edit for "query" only)
+ User is allowed to restore their queries (Restore for "query" only)
+ User is allowed to retire their queries (Retire for "query" only)
+  (Search for "query" only)
+ User is allowed to view their own and public queries (View for "query" only)
+ User is allowed to access status (View for "status" only)
+ User is allowed to edit their own user details (Edit for "user": ('username', 'password', 'address', 'realname', 'phone', 'organisation', 'alternate_addresses', 'queries', 'timezone') only)
+  (View for "user": ('id', 'organisation', 'phone', 'realname', 'timezone', 'username') only)
+ User is allowed to view their own user details (View for "user" only)
+"""
+        print(out.getvalue())
+
+        self.assertEqual(result, out.getvalue())
+        self.assertEqual(ret, 0)
+
+    def testSecurityInvalidAttribute(self):
+        ''' Test with an invalid attribute.
+            Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+        self.maxDiff = None # we want full diff
+
+        self.install_init()
+
+        # edit in an invalid attribute/property
+        with open(self.dirname + "/schema.py", "r+") as f:
+            d = f.readlines()
+            f.seek(0)
+            for i in d:
+                if "organisation" in i:
+                    i = i.replace("'id', 'organisation'","'id', 'organization'")
+                f.write(i)
+            f.truncate()
+
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'security' ]
+            ret = self.admin.main()
+
+        result = """New Web users get the Role "User"
+New Email users get the Role "User"
+Role "admin":
+ User may create everything (Create)
+ User may edit everything (Edit)
+ User may use the email interface (Email Access)
+ User may access the rest interface (Rest Access)
+ User may restore everything (Restore)
+ User may retire everything (Retire)
+ User may view everything (View)
+ User may access the web interface (Web Access)
+ User may manipulate user Roles through the web (Web Roles)
+ User may access the xmlrpc interface (Xmlrpc Access)
+Role "anonymous":
+ User may access the web interface (Web Access)
+ User is allowed to access file (View for "file" only)
+ User is allowed to access issue (View for "issue" only)
+ User is allowed to access keyword (View for "keyword" only)
+ User is allowed to access msg (View for "msg" only)
+ User is allowed to access priority (View for "priority" only)
+ User is allowed to access status (View for "status" only)
+ User is allowed to register new user (Register for "user" only)
+  (Search for "user" only)
+Role "user":
+ User may use the email interface (Email Access)
+ User may access the rest interface (Rest Access)
+ User may access the web interface (Web Access)
+ User may access the xmlrpc interface (Xmlrpc Access)
+ User is allowed to create file (Create for "file" only)
+ User is allowed to edit file (Edit for "file" only)
+ User is allowed to access file (View for "file" only)
+ User is allowed to create issue (Create for "issue" only)
+ User is allowed to edit issue (Edit for "issue" only)
+ User is allowed to access issue (View for "issue" only)
+ User is allowed to create keyword (Create for "keyword" only)
+ User is allowed to edit keyword (Edit for "keyword" only)
+ User is allowed to access keyword (View for "keyword" only)
+ User is allowed to create msg (Create for "msg" only)
+ User is allowed to edit msg (Edit for "msg" only)
+ User is allowed to access msg (View for "msg" only)
+ User is allowed to access priority (View for "priority" only)
+ User is allowed to create queries (Create for "query" only)
+ User is allowed to edit their queries (Edit for "query" only)
+ User is allowed to restore their queries (Restore for "query" only)
+ User is allowed to retire their queries (Retire for "query" only)
+  (Search for "query" only)
+ User is allowed to view their own and public queries (View for "query" only)
+ User is allowed to access status (View for "status" only)
+ User is allowed to edit their own user details (Edit for "user": ('username', 'password', 'address', 'realname', 'phone', 'organisation', 'alternate_addresses', 'queries', 'timezone') only)
+  (View for "user": ('id', 'organization', 'phone', 'realname', 'timezone', 'username') only)
+
+  **Invalid properties for user: ['organization']
+
+"""
+        print(out.getvalue())
+
+        self.assertEqual(result, out.getvalue())
+        self.assertEqual(ret, 1)
+
     def testSet(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.install_init()
         self.admin=AdminTool()
 
@@ -719,8 +1710,8 @@ class AdminTest(object):
 
         out = out.getvalue().strip()
         err = err.getvalue().strip()
-        self.assertEqual(len(out), 0)
-        self.assertEqual(len(err), 0)
+        self.assertEqual(out, '')
+        self.assertEqual(err, '')
 
         self.admin=AdminTool()
         with captured_output() as (out, err):
@@ -795,8 +1786,6 @@ class AdminTest(object):
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.install_init()
 
         self.admin=AdminTool()
@@ -847,8 +1836,8 @@ class AdminTest(object):
 
         out = out.getvalue().strip()
         err = err.getvalue().strip()
-        self.assertEqual(len(out), 0)
-        self.assertEqual(len(err), 0)
+        self.assertEqual(out, '')
+        self.assertEqual(err, '')
 
         ## verify that issue 1 and 2 are assigned to user2 and user2
         self.admin=AdminTool()
@@ -863,13 +1852,444 @@ class AdminTest(object):
         self.assertEqual(out, expected)
         self.assertEqual(len(err), 0)
 
+    def testReadline(self):
+        ''' Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+
+        '''history didn't work when testing. The commands being
+           executed aren't being sent into the history
+           buffer. Failed under both windows and linux.
+
+           Explicitly using: readline.set_auto_history(True) in
+           roundup-admin setup had no effect.
+
+           Looks like monkeypatching stdin is the issue since:
+        
+              printf... | roundup-admin | tee
+
+           doesn't work either when printf uses
+
+              "readline vi\nreadline emacs\nreadline history\nquit\n"
+
+           Added explicit readline.add_history() if stdin or
+           stdout are not a tty to admin.py:interactive().
+
+           Still no way to drive editing with control/escape
+           chars to verify editing mode, check keybindings. Need
+           to trick Admintool to believe it's running on a
+           tty/pty/con in linux/windows to remove my hack.
+        '''
+
+        # Put the init file in the tracker test directory so
+        # we don't clobber user's actual init file.
+        original_home = None
+        if 'HOME' in os.environ:
+            original_home = os.environ['HOME']
+            os.environ['HOME'] = self.dirname
+
+        # same but for windows.
+        original_userprofile = None
+        if 'USERPROFILE' in os.environ:
+            # windows
+            original_userprofile = os.environ['USERPROFILE']
+            os.environ['USERPROFILE'] = self.dirname
+
+        inputs = ["readline vi", "readline emacs", "readline reload", "quit"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable loading and saving history
+        self.admin.settings['history_features'] = 3
+
+        # verify correct init file is being
+        self.assertIn(os.path.join(os.path.expanduser("~"),
+                                   ".roundup_admin_rlrc"),
+                      self.admin.get_readline_init_file())
+
+        # No exception is raised for missing file
+        # under pyreadline3. Detect pyreadline3 looking for:
+        #   readline.Readline
+        pyreadline = hasattr(self.admin.readline, "Readline")
+
+        sys.argv=['main', '-i', self.dirname]
+
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+            out = out.getvalue().strip().split('\n')
+            
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        expected = 'roundup> Enabled vi mode.'
+        self.assertIn(expected, out)
+
+        expected = 'roundup> Enabled emacs mode.'
+        self.assertIn(expected, out)
+
+        if not pyreadline:
+            expected = ('roundup> Init file %s '
+                        'not found.' % self.admin.get_readline_init_file())
+            self.assertIn(expected, out)
+
+        # --- test 2
+        
+        inputs = ["readline reload", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        with open(self.admin.get_readline_init_file(),
+                  "w") as config_file:
+            # there is no config line that works for all
+            # pyreadline3 (windows), readline(*nix), or editline
+            # (mac). So write empty file.
+            config_file.write("")
+
+        # disable loading and saving history
+        self.admin.settings['history_features'] = 3
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+            out = out.getvalue().strip().split('\n')
+            
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        expected = ('roundup> File %s reloaded.' %
+                    self.admin.get_readline_init_file())
+        
+        self.assertIn(expected, out)
+
+        # --- test 3,4 - make sure readline gets history_length pragma.
+        #   test CLI and interactive.
+        
+        inputs = ["pragma list", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable all config/history
+        self.admin.settings['history_features'] = 7
+        sys.argv=['main', '-i', self.dirname, '-P', 'history_length=11']
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+            out = out.getvalue().strip().split('\n')
+            
+        print(ret)
+        self.assertTrue(ret == 0)
+        self.assertEqual(self.admin.readline.get_history_length(),
+                         11)
+
+        # 4
+        inputs = ["pragma history_length=17", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable all config/history
+        self.admin.settings['history_features'] = 7
+        # keep pragma in CLI. Make sure it's overridden by interactive
+        sys.argv=['main', '-i', self.dirname, '-P', 'history_length=11']
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+            out = out.getvalue().strip().split('\n')
+            
+        print(ret)
+        self.assertTrue(ret == 0)
+        # should not be 11.
+        self.assertEqual(self.admin.readline.get_history_length(),
+                         17)
+
+        # --- test 5 invalid single word parameter
+        
+        inputs = ["readline nosuchdirective", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable loading and saving history
+        self.admin.settings['history_features'] = 3
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+            out = out.getvalue().strip().split('\n')
+            
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        expected = ('roundup> Unknown readline parameter nosuchdirective')
+        
+        self.assertIn(expected, out)
+
+        # --- test 6 set keystroke command.
+        # FIXME: unable to test key binding/setting actually works.
+        #
+        #        No errors seem to come back from readline or
+        #        pyreadline3 even when the keybinding makes no
+        #        sense. Errors are only reported when reading
+        #        from init file. Using "set answer 42" does print
+        #        'readline: answer: unknown variable name' when
+        #        attached to tty/pty and interactive, but not
+        #        inside test case. Pyreadline3 doesn't
+        #        report errors at all.
+        #
+        #        Even if I set a keybidning, I can't invoke it
+        #        because I am not running inside a pty, so
+        #        editing is disabled and I have no way to
+        #        simulate keyboard keystrokes for readline to act
+        #        upon.
+        
+        inputs = ['readline set meaning 42', "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable loading and saving history
+        self.admin.settings['history_features'] = 3
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+            out = out.getvalue().strip().split('\n')
+            
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        # === cleanup
+        if original_home:
+            os.environ['HOME'] = original_home
+        if original_userprofile:
+            os.environ['USERPROFILE'] = original_userprofile
+
+    def test_admin_history_save_load(self):
+        # To prevent overwriting/reading user's actual history,
+        # change HOME enviroment var.
+        original_home = None
+        if 'HOME' in os.environ:
+            original_home = os.environ['HOME']
+            os.environ['HOME'] = self.dirname
+        os.environ['HOME'] = self.dirname
+
+        # same idea but windows
+        original_userprofile = None
+        if 'USERPROFILE' in os.environ:
+            # windows
+            original_userprofile = os.environ['USERPROFILE']
+            os.environ['USERPROFILE'] = self.dirname
+
+        # -- history test
+        inputs = ["readline history", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # use defaults load/save history
+        self.admin.settings['history_features'] = 0
+        
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        expected = 'roundup> history size 1'
+        self.assertIn(expected, out)
+
+        expected = '  1 readline history'
+        self.assertIn(expected, out)
+
+        # -- history test 3 reruns readline vi
+        inputs = ["readline vi", "readline history", "!3",
+                  "readline history", "!23s", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        # preserve directory self.install_init()
+        self.admin=AdminTool()
+
+        # default use all features
+        #self.admin.settings['history_features'] = 3
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        # 4 includes 2 commands in saved history
+        expected = 'roundup> history size 4'
+        self.assertIn(expected, out)
+
+        expected = '  4 readline history'
+        self.assertIn(expected, out)
+
+        # Shouldn't work on windows.
+        if platform.system() != "Windows":
+            expected = '  5 readline vi'
+            self.assertIn(expected, out)
+        else:
+            # PYREADLINE UNDER WINDOWS
+            # py3readline on windows can't replace
+            # command strings in history when connected
+            # to a console. (Console triggers autosave and
+            # I have to turn !3 into it's substituted value.)
+            # but in testing autosave is disabled so
+            # I don't get the !number but the actual command
+            # It should have 
+            #
+            #             expected = '  5 !3'
+            #
+            # but it is the same as the unix case.
+            expected = '  5 readline vi'
+            self.assertIn(expected, out)
+
+        expected = ('roundup> Unknown command "!23s" ("help commands" '
+                    'for a list)')
+        self.assertIn(expected, out)
+        
+        print(out)
+        # can't test !#:p mode as readline editing doesn't work
+        # if not in a tty.
+        
+        # === cleanup
+        if original_home:
+            os.environ['HOME'] = original_home
+        if original_userprofile:
+            os.environ['USERPROFILE'] = original_userprofile
+        
+    def test_admin_readline_history(self):
+        original_home = os.environ['HOME']
+        # To prevent overwriting/reading user's actual history,
+        # change HOME enviroment var.
+        os.environ['HOME'] = self.dirname
+
+        original_userprofile = None
+        if 'USERPROFILE' in os.environ:
+            # windows
+            original_userprofile = os.environ['USERPROFILE']
+            os.environ['USERPROFILE'] = self.dirname
+
+        # -- history test
+        inputs = ["readline history", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable loading, but save history
+        self.admin.settings['history_features'] = 3
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        expected = 'roundup> history size 1'
+        self.assertIn(expected, out)
+
+        expected = '  1 readline history'
+        self.assertIn(expected, out)
+
+        # -- history test
+        inputs = ["readline vi", "readline history", "!1", "!2", "q"]
+        
+        self._monkeypatch.setattr(
+            'sys.stdin',
+            io.StringIO("\n".join(inputs)))
+
+        self.install_init()
+        self.admin=AdminTool()
+
+        # disable loading, but save history
+        self.admin.settings['history_features'] = 3
+        sys.argv=['main', '-i', self.dirname]
+        
+        with captured_output() as (out, err):
+            ret = self.admin.main()
+        out = out.getvalue().strip().split('\n')
+        
+        print(ret)
+        self.assertTrue(ret == 0)
+
+        expected = 'roundup> history size 2'
+        self.assertIn(expected, out)
+
+        expected = '  2 readline history'
+        self.assertIn(expected, out)
+
+        # doesn't work on windows.
+        if platform.system() != "Windows":
+            expected = '  4 readline history'
+            self.assertIn(expected, out)
+        else:
+            # See 
+            # PYREADLINE UNDER WINDOWS
+            # elsewhere in this file for why I am not checking for
+            #  expected = '  4 !2'
+            expected = '  4 readline history'
+            self.assertIn(expected, out)
+
+        # can't test !#:p mode as readline editing doesn't work
+        # if not in a tty.
+        
+        # === cleanup
+        os.environ['HOME'] = original_home
+        if original_userprofile:
+            os.environ['USERPROFILE'] = original_userprofile
+
     def testSpecification(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.install_init()
         self.admin=AdminTool()
 
@@ -884,6 +2304,7 @@ class AdminTest(object):
                 'timezone: <roundup.hyperdb.String>',
                 'password: <roundup.hyperdb.Password>',
             ]
+
             
         with captured_output() as (out, err):
             sys.argv=['main', '-i', self.dirname, 'specification', 'user']
@@ -893,13 +2314,173 @@ class AdminTest(object):
         print(outlist)
         self.assertEqual(sorted(outlist), sorted(spec))
 
+        # -----
+        self.install_init()
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-P',
+                      'display_protected=1', 'specification', 'user']
+            ret = self.admin.main()
+
+        outlist = out.getvalue().strip().split('\n')
+        
+        protected = [ 'id: <roundup.hyperdb.String>',
+                      'creation: <roundup.hyperdb.Date>',
+                      'activity: <roundup.hyperdb.Date>',
+                      'creator: <roundup.hyperdb.Link to "user">',
+                      'actor: <roundup.hyperdb.Link to "user">']
+        print(outlist)
+        self.assertEqual(sorted(outlist), sorted(spec + protected))
+
+    def testRetireRestore(self):
+        ''' Note the tests will fail if you run this under pdb.
+            the context managers capture the pdb prompts and this screws
+            up the stdout strings with (pdb) prefixed to the line.
+        '''
+        # create user1 at id 3
+        self.install_init()
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'create', 'user',
+                      'username=user1', 'address=user1' ]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '3')
+
+        # retire user1 at id 3
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'retire', 'user3']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '')
+
+        # create new user1 at id 4 - note need unique address to succeed.
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'create', 'user',
+                      'username=user1', 'address=user1a' ]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '4')
+
+        # fail to restore old user1 at id 3
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'restore', 'user3']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        self.assertIn('Error: Key property (username) of retired node clashes with existing one (user1)', out)
+
+        # verify that user4 is listed
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'list', 'user']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        expected="1: admin\n   2: anonymous\n   4: user1"
+        self.assertEqual(out, expected)
+
+        # retire user4
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'retire', 'user4']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '')
+
+        # now we can restore user3
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'restore', 'user3']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        self.assertEqual(out, '')
+
+        # verify that user3 is listed
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'list', 'user']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        expected="1: admin\n   2: anonymous\n   3: user1"
+        self.assertEqual(out, expected)
+
+        # test show_retired pragma three cases:
+        # no - no retired items
+        # only - only retired items
+        # both - all items
+
+        # verify that user4 only is listed
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-P',
+                      'show_retired=only', 'list', 'user']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        expected="4: user1"
+        self.assertEqual(out, expected)
+
+        # verify that all users are shown
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-P',
+                      'show_retired=both', 'list', 'user']
+            ret = self.admin.main()
+        out_list = sorted(out.getvalue().strip().split("\n"))
+        print(out)
+        expected_list=sorted("1: admin\n   2: anonymous\n   3: user1\n   4: user1".split("\n"))
+        self.assertEqual(out_list, expected_list)
+
+        # verify that active users are shown
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-P',
+                      'show_retired=no', 'list', 'user']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        expected="1: admin\n   2: anonymous\n   3: user1"
+        self.assertEqual(out, expected)
+
+        # test display headers for retired/active
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, '-P',
+                      'display_header=yes', 'display', 'user3,user4']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        self.assertIn("[user3 (active)]\n", out)
+        self.assertIn( "[user4 (retired)]\n", out)
+
+        # test that there are no headers
+        self.admin=AdminTool()
+        with captured_output() as (out, err):
+            sys.argv=['main', '-i', self.dirname, 'display', 'user3,user4']
+            ret = self.admin.main()
+        out = out.getvalue().strip()
+        print(out)
+        self.assertNotIn("user3", out)
+        self.assertNotIn("user4", out)
+
     def testTable(self):
         ''' Note the tests will fail if you run this under pdb.
             the context managers capture the pdb prompts and this screws
             up the stdout strings with (pdb) prefixed to the line.
         '''
-        import sys
-
         self.install_init()
         self.admin=AdminTool()
 
@@ -1011,6 +2592,37 @@ class AdminTest(object):
         print(expected)
         self.assertEqual(out, expected)
 
+    def testTemplates(self):
+        
+        self.install_init()
+        self.admin=AdminTool()
+
+        with captured_output() as (out, err):
+            # command does not require a tracker home. use missing zZzZ
+            # directory to cause error if that changes
+            sys.argv=['main', '-i', "zZzZ", 'templates' ]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+
+        # all 5 standard trackers should be found
+        for tracker in ['Name: classic\nPath:',
+                        'Name: devel\nPath:',
+                        'Name: jinja2\nPath:',
+                        'Name: minimal\nPath:',
+                        'Name: responsive\nPath:']:
+            self.assertIn(tracker, out)
+
+        with captured_output() as (out, err):
+            # command does not require a tracker home. use missing zZzZ
+            # directory to cause error if that changes
+            sys.argv=['main', '-i', "zZzZ", 'templates', 'trace_search' ]
+            ret = self.admin.main()
+
+        out = out.getvalue().strip()
+
+        expected = "/*\n"
+        self.assertIn(expected, out)
 
 class anydbmAdminTest(AdminTest, unittest.TestCase):
     backend = 'anydbm'
